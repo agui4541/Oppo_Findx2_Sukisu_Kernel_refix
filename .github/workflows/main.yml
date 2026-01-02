@@ -1,4 +1,4 @@
-name: Build Kernel (Clang 12 Fix)
+name: Build Kernel (Checkpoint)
 
 on:
   workflow_dispatch:
@@ -31,13 +31,12 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/toolchains
         cd $GITHUB_WORKSPACE/toolchains
         
-        # 更换为 Clang 12 (r416183b)，这个版本编译 4.19 内核非常稳定
-        echo "Downloading Clang 12..."
+        # Clang 12
         wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-12.0.0_r32/clang-r416183b.tar.gz
         mkdir clang-12
         tar -xzf clang-r416183b.tar.gz -C clang-12
         
-        # GCC 仍然使用 4.9，这是必须的
+        # GCC 4.9
         git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git aarch64-linux-android-4.9
         git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git arm-linux-androideabi-4.9
 
@@ -48,65 +47,46 @@ jobs:
 
     - name: Fix Source Code Errors
       run: |
-        # 修复函数原型报错
         if [ -f arch/arm64/kernel/rootguard/oplus_guard_general.c ]; then
             sed -i 's/static void __exit boot_state_exit()/static void __exit boot_state_exit(void)/' arch/arm64/kernel/rootguard/oplus_guard_general.c || true
         fi
-        
-        # 修复可能存在的 VDSO 汇编兼容性问题（可选，Clang 12通常不需要）
-        # sed -i 's/register long ret asm ("x0");/long ret;/g' arch/arm64/include/asm/vdso/gettimeofday.h || true
 
     - name: Configure Kernel
       run: |
-        # 设置变量
         TC_DIR=$GITHUB_WORKSPACE/toolchains
-        CLANG_PATH=$TC_DIR/clang-12/bin
-        GCC64_PATH=$TC_DIR/aarch64-linux-android-4.9/bin
-        GCC32_PATH=$TC_DIR/arm-linux-androideabi-4.9/bin
-        
-        export PATH=$CLANG_PATH:$GCC64_PATH:$GCC32_PATH:$PATH
+        export PATH=$TC_DIR/clang-12/bin:$TC_DIR/aarch64-linux-android-4.9/bin:$TC_DIR/arm-linux-androideabi-4.9/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
-        
-        # 关键修改：显式指定 CLANG_TRIPLE，这在旧 Makefile 中有时会被忽略
-        export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=aarch64-linux-android-
-        export CROSS_COMPILE_ARM32=arm-linux-androideabi-
-        export CC=clang
         
         mkdir -p out
         make O=out clean
         make O=out mrproper
-        make O=out stock_defconfig
+        
+        # 使用 Clang 12 时，指定 target 和 triple
+        make O=out stock_defconfig \
+             CC="clang" \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             CROSS_COMPILE_ARM32=arm-linux-androideabi-
         
         # SukiSU Config
         scripts/config --file out/.config --enable CONFIG_KSU
         scripts/config --file out/.config --enable CONFIG_KPROBES
         scripts/config --file out/.config --enable CONFIG_HAVE_KPROBES
         scripts/config --file out/.config --enable CONFIG_KPROBE_EVENTS
-        # 禁用 LTO，提高通过率
         scripts/config --file out/.config --disable CONFIG_LTO
         scripts/config --file out/.config --disable CONFIG_LTO_CLANG
         scripts/config --file out/.config --disable CONFIG_THIN_LTO
-        # 禁用 Werror
         scripts/config --file out/.config --disable CONFIG_WERROR
 
-    - name: Build Kernel
+    - name: Build Kernel (Compiling)
       run: |
         TC_DIR=$GITHUB_WORKSPACE/toolchains
-        CLANG_PATH=$TC_DIR/clang-12/bin
-        GCC64_PATH=$TC_DIR/aarch64-linux-android-4.9/bin
-        GCC32_PATH=$TC_DIR/arm-linux-androideabi-4.9/bin
-        
-        export PATH=$CLANG_PATH:$GCC64_PATH:$GCC32_PATH:$PATH
+        export PATH=$TC_DIR/clang-12/bin:$TC_DIR/aarch64-linux-android-4.9/bin:$TC_DIR/arm-linux-androideabi-4.9/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
         
-        # === 核心修改 ===
-        # 1. 强制传入 CLANG_TRIPLE
-        # 2. KCFLAGS=-w 忽略所有警告
-        # 3. 如果之前的错误依然存在，说明 Makefile 没吃进 CROSS_COMPILE，我们尝试在 CC 中直接指定 target
-        
+        # 使用 --target 参数强制指定架构，解决寄存器报错
         make -j$(nproc --all) O=out \
              CC="clang --target=aarch64-linux-gnu" \
              CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -114,6 +94,14 @@ jobs:
              CROSS_COMPILE_ARM32=arm-linux-androideabi- \
              KCFLAGS=-w \
              Image
+
+    # === 检查点 1：编译完成立即上传 Image ===
+    - name: Upload Raw Kernel Image (Checkpoint)
+      if: success() # 只有编译成功才上传
+      uses: actions/upload-artifact@v4
+      with:
+        name: Image-Only-Backup
+        path: out/arch/arm64/boot/Image
 
     - name: Package with AnyKernel3
       if: success()
@@ -131,9 +119,10 @@ jobs:
         sed -i 's/device.name2=toro/device.name2=PDEM10/' anykernel.sh
         zip -r9 ../Oppo_FindX2_SukiSU_Kernel.zip *
 
-    - name: Upload Artifact
+    # === 检查点 2：最终成品上传 ===
+    - name: Upload Flashable Zip
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: Oppo_FindX2_SukiSU_Kernel
+        name: Oppo_FindX2_SukiSU_Flashable
         path: Oppo_FindX2_SukiSU_Kernel.zip
