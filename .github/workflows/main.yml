@@ -1,4 +1,4 @@
-name: Build Kernel (Checkpoint)
+name: Build Kernel (SukiSU 4.19 Fix)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/toolchains
         cd $GITHUB_WORKSPACE/toolchains
         
-        # Clang 12
+        # 使用 Clang 12 (最稳妥的选择)
         wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-12.0.0_r32/clang-r416183b.tar.gz
         mkdir clang-12
         tar -xzf clang-r416183b.tar.gz -C clang-12
@@ -45,11 +45,16 @@ jobs:
         curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ github.event.inputs.ksubranch }}/kernel/setup.sh" | bash -s nongki
         sed -i '$a\' init/Kconfig
 
-    - name: Fix Source Code Errors
+    - name: Fix Source Code Errors (Crucial Steps)
       run: |
+        # 1. 修复 Oplus RootGuard 函数原型 (void)
         if [ -f arch/arm64/kernel/rootguard/oplus_guard_general.c ]; then
             sed -i 's/static void __exit boot_state_exit()/static void __exit boot_state_exit(void)/' arch/arm64/kernel/rootguard/oplus_guard_general.c || true
         fi
+
+        # 2. 【新增修复】移除 4.19 不支持的 MODULE_IMPORT_NS
+        # 这行代码在非 GKI 内核上是多余的，且会导致编译失败
+        sed -i '/MODULE_IMPORT_NS/d' drivers/kernelsu/ksu.c || true
 
     - name: Configure Kernel
       run: |
@@ -62,7 +67,6 @@ jobs:
         make O=out clean
         make O=out mrproper
         
-        # 使用 Clang 12 时，指定 target 和 triple
         make O=out stock_defconfig \
              CC="clang" \
              CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -79,14 +83,14 @@ jobs:
         scripts/config --file out/.config --disable CONFIG_THIN_LTO
         scripts/config --file out/.config --disable CONFIG_WERROR
 
-    - name: Build Kernel (Compiling)
+    - name: Build Kernel
       run: |
         TC_DIR=$GITHUB_WORKSPACE/toolchains
         export PATH=$TC_DIR/clang-12/bin:$TC_DIR/aarch64-linux-android-4.9/bin:$TC_DIR/arm-linux-androideabi-4.9/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
         
-        # 使用 --target 参数强制指定架构，解决寄存器报错
+        # 使用 --target 强制指定架构，KCFLAGS=-w 忽略警告
         make -j$(nproc --all) O=out \
              CC="clang --target=aarch64-linux-gnu" \
              CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -96,8 +100,8 @@ jobs:
              Image
 
     # === 检查点 1：编译完成立即上传 Image ===
-    - name: Upload Raw Kernel Image (Checkpoint)
-      if: success() # 只有编译成功才上传
+    - name: Upload Raw Kernel Image
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: Image-Only-Backup
