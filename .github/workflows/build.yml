@@ -1,7 +1,7 @@
-name: Build Kernel for OPPO FindX2 (SUSFS + Prebuilt LLVM)
+name: Build Kernel for OPPO FindX2 (SUSFS + Horizon Clang)
 
 on:
-  workflow_dispatch: # 手动触发工作流
+  workflow_dispatch: # 手动触发
 
 jobs:
   build:
@@ -11,7 +11,7 @@ jobs:
     - name: 检出内核源码
       uses: actions/checkout@v4
       with:
-        submodules: recursive # 重要：确保检出子模块（如果源码有）
+        submodules: recursive
 
     - name: 安装基础编译依赖
       run: |
@@ -19,52 +19,55 @@ jobs:
         sudo apt-get install -y \
           bc bison build-essential cpio flex libelf-dev libssl-dev \
           git kmod libncurses5-dev lz4 python3 wget xz-utils \
-          make # 确保make命令可用
+          make file
         echo "基础依赖安装完成。"
 
-    - name: 下载预编译的 LLVM 工具链
+    - name: 下载 Horizon Clang 工具链
       run: |
         mkdir -p ${{ github.workspace }}/toolchains
         cd ${{ github.workspace }}/toolchains
-        # 下载 Linux 内核社区官方维护的预编译 LLVM 工具链 (LLVM 18.1.5)
-        # 此版本兼容性好，专为构建内核优化
-        wget -q --show-progress https://kernel.org/pub/tools/llvm/llvm-18.1.5-aarch64-linux-gnu.tar.xz
-        tar -xf llvm-18.1.5-aarch64-linux-gnu.tar.xz
-        # 将工具链路径设置为环境变量，供后续步骤使用
-        echo "LLVM_PATH=${{ github.workspace }}/toolchains/llvm-18.1.5-aarch64-linux-gnu/bin" >> $GITHUB_ENV
-        echo "预编译 LLVM 18.1.5 工具链已下载并解压。"
+        
+        # 从 GitHub Releases 下载 Horizon Clang (网络更可靠)
+        # 这里是 v18.1.5 版本，你也可以替换为更新的版本
+        wget -q --show-progress https://github.com/Horizon-Devices/Horizon-Clang/archive/refs/tags/v18.1.5.tar.gz -O horizon-clang.tar.gz
+        tar -xf horizon-clang.tar.gz
+        # 解压后的目录名通常是 Horizon-Clang-18.1.5，但可能因版本变化，建议用通配符或 ls 确认
+        echo "CLANG_PATH=${{ github.workspace }}/toolchains/$(ls -d Horizon-Clang-*)/bin" >> $GITHUB_ENV
+        echo "Horizon Clang 工具链已下载，路径: ${{ github.workspace }}/toolchains/$(ls -d Horizon-Clang-*)/bin"
+        
+        # 【备用选项】如果上面失败，可以尝试下载质子 Clang，取消下面几行的注释并注释掉上面的wget/tar/echo命令
+        # wget -q --show-progress https://github.com/kdrag0n/proton-clang/archive/refs/tags/20241015.tar.gz -O proton-clang.tar.gz
+        # tar -xf proton-clang.tar.gz
+        # echo "CLANG_PATH=${{ github.workspace }}/toolchains/proton-clang-20241015/bin" >> $GITHUB_ENV
+        # echo "质子 Clang 工具链已下载。"
 
-    - name: 集成 SukiSU 与 SUSFS (实验性)
+    - name: 集成 SukiSU 与 SUSFS
       run: |
         cd ${{ github.workspace }}
-        # 使用 susfs-main 分支集成 SukiSU 和 SUSFS 模块
         curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
-        echo "SukiSU 与 SUSFS (main分支) 集成完成。"
+        echo "SukiSU 与 SUSFS 集成完成。"
 
     - name: 配置内核
       env:
-        ARCH: arm64 # 设置目标架构为 arm64
+        ARCH: arm64
       run: |
         cd ${{ github.workspace }}
-        # 根据你的仓库，使用正确的 defconfig 名称
-        # 这里假设为 stock_defconfig，请根据实际情况确认
+        # 关键：这里使用你的配置文件 stock_defconfig
         make stock_defconfig
         echo "内核配置完成。"
-        # (可选) 快速检查关键配置是否启用
-        echo "检查关键配置状态:"
+        # 可选：检查关键配置
+        echo "检查 SukiSU 相关配置:"
         grep -E "CONFIG_KPROBES=|CONFIG_OVERLAY_FS=|CONFIG_SUKI" .config || true
 
-    - name: 使用 LLVM 编译内核
+    - name: 使用 Clang 编译内核
       env:
         ARCH: arm64
-        # 核心：将 LLVM 环境变量指向预编译工具链的 bin 目录
-        # 内核构建系统会自动使用该路径下的 clang, llvm-ar 等所有工具
-        LLVM: ${{ env.LLVM_PATH }}/
+        # 核心：将 LLVM 变量指向我们下载的 Clang 工具链的父目录
+        # 构建系统会自动在该路径下查找 clang, llvm-ar 等所有工具
+        LLVM: ${{ env.CLANG_PATH }}/
       run: |
         cd ${{ github.workspace }}
-        echo "开始编译内核 (使用 LLVM)..."
-        # 开始编译，-j 参数根据 GitHub Actions Runner 的核心数自动设置
-        # 输出日志保存到 build.log 文件，方便调试
+        echo "开始编译内核，工具链路径: $LLVM"
         make -j$(nproc) Image.gz-dtb 2>&1 | tee build.log
         echo "编译步骤执行完毕。"
 
@@ -75,67 +78,55 @@ jobs:
           echo "✅ 成功：内核镜像已生成。"
           ls -lh "arch/arm64/boot/Image.gz-dtb"
         else
-          echo "❌ 错误：未找到内核镜像文件 ‘arch/arm64/boot/Image.gz-dtb’，编译可能失败。"
-          echo "请查看上一步的 ‘build.log’ 文件获取详细错误信息。"
-          exit 1 # 退出并报错，停止工作流
+          echo "❌ 错误：未找到内核镜像，编译可能失败。"
+          echo "以下是 build.log 的最后50行："
+          tail -n 50 build.log
+          exit 1
         fi
 
-    - name: 打包刷机包 (AnyKernel3 - 仅内核)
+    - name: 打包刷机包 (AnyKernel3)
       run: |
         cd ${{ github.workspace }}
-        echo "正在准备 AnyKernel3 打包环境..."
-        # 1. 下载 AnyKernel3 模板
+        echo "正在打包 AnyKernel3 刷机包..."
         wget -q https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.zip -O AnyKernel3.zip
         unzip -qo AnyKernel3.zip
         rm -f AnyKernel3.zip
-
-        # 2. 复制编译好的内核镜像到 AnyKernel3 目录
         cp arch/arm64/boot/Image.gz-dtb AnyKernel3-master/
 
-        # 3. 创建定制化的 anykernel.sh 脚本，这是关键
-        # 此脚本确保只刷写内核，不触碰 dtb/dtbo 分区
         cat > AnyKernel3-master/anykernel.sh << 'EOF'
         #!/bin/sh
         ## AnyKernel3 Script for OPPO FindX2
-        ## 设置设备信息（请根据你的设备实际情况确认 block 路径）
         device.name1=findx2
         device.name2=OP4E79L1
         block=/dev/block/bootdevice/by-name/boot
         is_slot_device=0
 
-        ## 核心设置：明确声明不处理 dtb/dtbo 和模块
+        ## 核心：只刷内核，不碰 dtb/dtbo
         do.devicecheck=1
         do.dtb=0
         do.dtbo=0
         do.modules=0
 
-        ## 函数定义
         dump_boot() {
           ui_print "正在备份原启动分区..."
           dd if="${block}" of="${split_img}/boot-orig.img"
         }
-
         write_boot() {
           ui_print "正在刷写新内核镜像..."
           dd if="${split_img}/Image.gz-dtb" of="${block}"
         }
-
-        ## 使用 AnyKernel3 的标准函数
         . tools/ak3-core.sh
         EOF
 
-        # 4. 进入目录并打包成 zip 文件
         cd AnyKernel3-master
-        zip -r9 "${{ github.workspace }}/kernel-findx2-susfs-signed.zip" . -x ".git/*" "README.md"
-        cd ..
-        echo "✅ 刷机包打包完成。"
+        zip -r9 "${{ github.workspace }}/kernel-findx2-susfs.zip" . -x ".git/*" "README.md"
+        echo "✅ 刷机包已生成：kernel-findx2-susfs.zip"
 
     - name: 上传构建产物
       uses: actions/upload-artifact@v4
       with:
-        name: FindX2-SUSFS-Kernel-Build
+        name: Kernel-With-SUSFS
         path: |
           ${{ github.workspace }}/arch/arm64/boot/Image.gz-dtb
-          ${{ github.workspace }}/kernel-findx2-susfs-signed.zip
+          ${{ github.workspace }}/kernel-findx2-susfs.zip
           ${{ github.workspace }}/build.log
-        retention-days: 7 # 产物保留7天
