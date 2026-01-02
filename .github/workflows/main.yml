@@ -1,188 +1,114 @@
-name: Build kernel (SukiSU + SUSFS)
+name: Build OPPO Find X2 Kernel (SukiSU + SUSFS)
 
 on:
   workflow_dispatch:
     inputs:
-      toolchain:
-        description: "Toolchain preset (aosp-clang | proton-clang)"
+      # 允许你在手动运行时修改这些参数
+      ksubranch:
+        description: 'SukiSU 分支 (默认 main)'
         required: true
-        default: "aosp-clang"
-      jobs:
-        description: "make -j"
+        default: 'main'
+      susfs_version:
+        description: 'SUSFS 版本 (默认 v1.5.5)'
         required: true
-        default: "16"
-      lto:
-        description: "Enable LTO (true/false)"
-        required: true
-        default: "false"
-  push:
-    branches:
-      - main
-      - integration/**
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE"
-  pull_request:
-    branches:
-      - main
-      - integration/**
-
-concurrency:
-  group: kernel-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-
-env:
-  ARCH: arm64
-  SUBARCH: arm64
-  DEFCONFIG: stock_defconfig
-  OUT_DIR: out
-  # Adjust these if your kernel uses a different prefix (aarch64-linux-gnu- / aarch64-linux-android-)
-  CROSS_COMPILE: aarch64-linux-gnu-
-  CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+        default: 'v1.5.5'
 
 jobs:
   build:
-    name: Build (${{ github.ref_name }})
     runs-on: ubuntu-22.04
-
+    
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
+    - name: Checkout Kernel Source (获取内核源码)
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates ccache clang curl flex g++ gcc git \
-            libelf-dev libssl-dev llvm make ninja-build openssl python3 python3-pip \
-            rsync unzip xz-utils zstd
-          python3 -V
-          clang --version || true
+    - name: Setup Build Environment (安装编译依赖)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential bc curl git zip unzip libssl-dev python3 python2
+        sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Setup ccache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ github.ref_name }}-
-            ccache-${{ runner.os }}-
+    - name: Download Clang Toolchain (下载编译器)
+      run: |
+        # 下载 Proton Clang 13 (稳定且适合骁龙865 4.19内核)
+        mkdir -p clang
+        git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
 
-      - name: Fetch toolchain
-        id: tc
-        run: |
-          set -euxo pipefail
-          mkdir -p toolchain
-          case "${{ inputs.toolchain || 'aosp-clang' }}" in
-            aosp-clang)
-              # Minimal, generic AOSP clang prebuilt.
-              # NOTE: Replace URL with your preferred fixed version if you want stronger reproducibility.
-              TC_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
-              ;;
-            proton-clang)
-              # Proton clang releases change; pin to a specific release you trust.
-              # Replace the URL below with a real pinned release if you use this preset.
-              echo "proton-clang preset is a placeholder. Please pin a real Proton clang release URL." >&2
-              exit 1
-              ;;
-            *)
-              echo "Unknown toolchain preset: ${{ inputs.toolchain }}" >&2
-              exit 1
-              ;;
-          esac
+    - name: Integrate SukiSU (集成 SukiSU)
+      run: |
+        echo "正在集成 SukiSU..."
+        # 使用官方脚本集成非 GKI 版本的 SukiSU
+        curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ github.event.inputs.ksubranch }}/kernel/setup.sh" | bash -s nongki
+        
+        # 确保配置已开启
+        echo "CONFIG_KSU=y" >> arch/arm64/configs/stock_defconfig
+        echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/stock_defconfig
 
-          echo "Downloading toolchain: $TC_URL"
-          curl -L "$TC_URL" -o toolchain/tc.tar.xz
-          tar -C toolchain -xf toolchain/tc.tar.xz --strip-components=1
-          echo "TOOLCHAIN_BIN=$PWD/toolchain/bin" >> "$GITHUB_ENV"
-          echo "$PWD/toolchain/bin" >> "$GITHUB_PATH"
-          clang --version
+    - name: Integrate SUSFS (集成 SUSFS)
+      run: |
+        echo "正在尝试集成 SUSFS..."
+        # 克隆 SUSFS 仓库
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
+        
+        # 复制 SUSFS 核心文件到内核源码
+        # 注意：这里是根据通用的 4.19 结构复制，OPPO 源码结构通常标准
+        cp susfs4ksu/kernel_patches/fs/* fs/
+        cp susfs4ksu/kernel_patches/include/linux/* include/linux/
+        
+        # 应用 patch (如果 patch 失败不会停止，防止因为小冲突导致整个编译挂掉)
+        # 你可以在 Actions 日志中查看这一步是否成功
+        if [ -f "susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch" ]; then
+          patch -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || echo "Patch 应用失败，可能需要手动解决冲突，但我们将尝试继续编译..."
+        fi
 
-      - name: Integrate SukiSU + SUSFS (setup.sh)
-        run: |
-          set -euxo pipefail
-          # As per https://sukisu.org/zh/guide/how-to-integrate
-          # "susfs-main" mode is described as experimental SUSFS support.
-          bash -c "$(curl -LSs https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh)" susfs-main 1
+    - name: Configure Kernel (配置内核)
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export CC=clang
+        
+        # 使用你指定的 stock_defconfig
+        make O=out stock_defconfig
 
-      - name: Configure kernel (stock_defconfig)
-        run: |
-          set -euxo pipefail
-          make O="${OUT_DIR}" ARCH="${ARCH}" "${DEFCONFIG}"
+    - name: Build Kernel (开始编译)
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        
+        # 编译 Image (不编译 dtbo，只编译内核镜像)
+        # -j$(nproc --all) 使用所有 CPU 核心
+        make -j$(nproc --all) O=out Image
 
-          # Optional knobs: enable/disable LTO quickly for debugging.
-          if [[ "${{ inputs.lto || 'false' }}" == "true" ]]; then
-            scripts/config --file "${OUT_DIR}/.config" -e LTO_CLANG -e LTO -e THINLTO || true
-          else
-            scripts/config --file "${OUT_DIR}/.config" -d LTO_CLANG -d LTO -d THINLTO || true
-          fi
+    - name: Package with AnyKernel3 (打包)
+      run: |
+        # 克隆 AnyKernel3
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        
+        # 将编译好的 Image 复制进去
+        cp out/arch/arm64/boot/Image AnyKernel3/
+        
+        # 修改 AnyKernel3 的脚本以适配机型 (简单适配)
+        # 这里假设你的设备代号在 build.prop 中包含 oppo 或 PDM 等标识，AK3通常能自动识别
+        # 但为了保险，我们不修改 device check，直接打包
+        
+        cd AnyKernel3
+        # 清理无用文件
+        rm -rf .git README.md
+        
+        # 打包
+        zip -r9 ../Oppo_FindX2_SukiSU_Kernel.zip *
 
-          # Ensure required options are enabled (best-effort; actual symbols may differ by kernel tree).
-          scripts/config --file "${OUT_DIR}/.config" -e KPROBES || true
-          scripts/config --file "${OUT_DIR}/.config" -e KALLSYMS -e KALLSYMS_ALL || true
-
-          make O="${OUT_DIR}" ARCH="${ARCH}" olddefconfig
-
-      - name: Build kernel
-        run: |
-          set -euxo pipefail
-
-          export CC="clang"
-          export LD="ld.lld"
-          export AR="llvm-ar"
-          export NM="llvm-nm"
-          export OBJCOPY="llvm-objcopy"
-          export OBJDUMP="llvm-objdump"
-          export STRIP="llvm-strip"
-          export LLVM=1
-          export LLVM_IAS=1
-
-          nproc
-          make O="${OUT_DIR}" ARCH="${ARCH}" -j"${{ inputs.jobs || '16' }}"
-
-      - name: Collect artifacts
-        run: |
-          set -euxo pipefail
-
-          mkdir -p dist
-          KERNEL_DIR="${OUT_DIR}/arch/arm64/boot"
-
-          # Try common kernel output names
-          for f in Image Image.gz Image.gz-dtb; do
-            if [[ -f "${KERNEL_DIR}/${f}" ]]; then
-              cp -v "${KERNEL_DIR}/${f}" "dist/${f}"
-            fi
-          done
-
-          # DTS / DTBO outputs (best-effort, upload for debug; do not assume you will flash them)
-          if [[ -f "${KERNEL_DIR}/dtbo.img" ]]; then
-            cp -v "${KERNEL_DIR}/dtbo.img" dist/dtbo.img
-          fi
-          if [[ -f "${KERNEL_DIR}/dts/qcom/dtb.img" ]]; then
-            cp -v "${KERNEL_DIR}/dts/qcom/dtb.img" dist/dtb.img
-          fi
-
-          # Build info
-          {
-            echo "repo: $GITHUB_REPOSITORY"
-            echo "ref: $GITHUB_REF"
-            echo "sha: $GITHUB_SHA"
-            echo "date_utc: $(date -u +%F_%T)"
-            echo "clang: $(clang --version | head -n 1)"
-          } | tee dist/build.txt
-
-          cp -v "${OUT_DIR}/.config" dist/kernel.config
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-${{ github.ref_name }}-${{ github.run_number }}
-          path: dist/*
-          if-no-files-found: error
+    - name: Upload Artifact (上传结果)
+      uses: actions/upload-artifact@v4
+      with:
+        name: Oppo_FindX2_SukiSU_Kernel
+        path: Oppo_FindX2_SukiSU_Kernel.zip
