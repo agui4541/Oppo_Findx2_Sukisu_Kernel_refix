@@ -1,0 +1,188 @@
+name: Build kernel (SukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain:
+        description: "Toolchain preset (aosp-clang | proton-clang)"
+        required: true
+        default: "aosp-clang"
+      jobs:
+        description: "make -j"
+        required: true
+        default: "16"
+      lto:
+        description: "Enable LTO (true/false)"
+        required: true
+        default: "false"
+  push:
+    branches:
+      - main
+      - integration/**
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+  pull_request:
+    branches:
+      - main
+      - integration/**
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  DEFCONFIG: stock_defconfig
+  OUT_DIR: out
+  # Adjust these if your kernel uses a different prefix (aarch64-linux-gnu- / aarch64-linux-android-)
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+
+jobs:
+  build:
+    name: Build (${{ github.ref_name }})
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache clang curl flex g++ gcc git \
+            libelf-dev libssl-dev llvm make ninja-build openssl python3 python3-pip \
+            rsync unzip xz-utils zstd
+          python3 -V
+          clang --version || true
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.ref_name }}-
+            ccache-${{ runner.os }}-
+
+      - name: Fetch toolchain
+        id: tc
+        run: |
+          set -euxo pipefail
+          mkdir -p toolchain
+          case "${{ inputs.toolchain || 'aosp-clang' }}" in
+            aosp-clang)
+              # Minimal, generic AOSP clang prebuilt.
+              # NOTE: Replace URL with your preferred fixed version if you want stronger reproducibility.
+              TC_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+              ;;
+            proton-clang)
+              # Proton clang releases change; pin to a specific release you trust.
+              # Replace the URL below with a real pinned release if you use this preset.
+              echo "proton-clang preset is a placeholder. Please pin a real Proton clang release URL." >&2
+              exit 1
+              ;;
+            *)
+              echo "Unknown toolchain preset: ${{ inputs.toolchain }}" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Downloading toolchain: $TC_URL"
+          curl -L "$TC_URL" -o toolchain/tc.tar.xz
+          tar -C toolchain -xf toolchain/tc.tar.xz --strip-components=1
+          echo "TOOLCHAIN_BIN=$PWD/toolchain/bin" >> "$GITHUB_ENV"
+          echo "$PWD/toolchain/bin" >> "$GITHUB_PATH"
+          clang --version
+
+      - name: Integrate SukiSU + SUSFS (setup.sh)
+        run: |
+          set -euxo pipefail
+          # As per https://sukisu.org/zh/guide/how-to-integrate
+          # "susfs-main" mode is described as experimental SUSFS support.
+          bash -c "$(curl -LSs https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh)" susfs-main 1
+
+      - name: Configure kernel (stock_defconfig)
+        run: |
+          set -euxo pipefail
+          make O="${OUT_DIR}" ARCH="${ARCH}" "${DEFCONFIG}"
+
+          # Optional knobs: enable/disable LTO quickly for debugging.
+          if [[ "${{ inputs.lto || 'false' }}" == "true" ]]; then
+            scripts/config --file "${OUT_DIR}/.config" -e LTO_CLANG -e LTO -e THINLTO || true
+          else
+            scripts/config --file "${OUT_DIR}/.config" -d LTO_CLANG -d LTO -d THINLTO || true
+          fi
+
+          # Ensure required options are enabled (best-effort; actual symbols may differ by kernel tree).
+          scripts/config --file "${OUT_DIR}/.config" -e KPROBES || true
+          scripts/config --file "${OUT_DIR}/.config" -e KALLSYMS -e KALLSYMS_ALL || true
+
+          make O="${OUT_DIR}" ARCH="${ARCH}" olddefconfig
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+
+          export CC="clang"
+          export LD="ld.lld"
+          export AR="llvm-ar"
+          export NM="llvm-nm"
+          export OBJCOPY="llvm-objcopy"
+          export OBJDUMP="llvm-objdump"
+          export STRIP="llvm-strip"
+          export LLVM=1
+          export LLVM_IAS=1
+
+          nproc
+          make O="${OUT_DIR}" ARCH="${ARCH}" -j"${{ inputs.jobs || '16' }}"
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+
+          mkdir -p dist
+          KERNEL_DIR="${OUT_DIR}/arch/arm64/boot"
+
+          # Try common kernel output names
+          for f in Image Image.gz Image.gz-dtb; do
+            if [[ -f "${KERNEL_DIR}/${f}" ]]; then
+              cp -v "${KERNEL_DIR}/${f}" "dist/${f}"
+            fi
+          done
+
+          # DTS / DTBO outputs (best-effort, upload for debug; do not assume you will flash them)
+          if [[ -f "${KERNEL_DIR}/dtbo.img" ]]; then
+            cp -v "${KERNEL_DIR}/dtbo.img" dist/dtbo.img
+          fi
+          if [[ -f "${KERNEL_DIR}/dts/qcom/dtb.img" ]]; then
+            cp -v "${KERNEL_DIR}/dts/qcom/dtb.img" dist/dtb.img
+          fi
+
+          # Build info
+          {
+            echo "repo: $GITHUB_REPOSITORY"
+            echo "ref: $GITHUB_REF"
+            echo "sha: $GITHUB_SHA"
+            echo "date_utc: $(date -u +%F_%T)"
+            echo "clang: $(clang --version | head -n 1)"
+          } | tee dist/build.txt
+
+          cp -v "${OUT_DIR}/.config" dist/kernel.config
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ github.ref_name }}-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
