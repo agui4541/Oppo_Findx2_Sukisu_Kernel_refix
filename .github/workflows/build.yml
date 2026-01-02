@@ -1,0 +1,103 @@
+name: Build Kernel for FindX2 (SUSFS + LLVM)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 检出内核源码
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: 安装构建依赖和现代LLVM工具链
+      run: |
+        sudo apt-get update
+        # 安装构建必需的工具和LLVM（包含Clang和lld链接器）
+        sudo apt-get install -y \
+          bc bison build-essential cpio flex libelf-dev libssl-dev \
+          git kmod libncurses5-dev lz4 python3 wget \
+          clang lld llvm llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf
+        echo "现代LLVM工具链安装完成。"
+
+    - name: 集成 SukiSU 与 SUSFS (实验性)
+      run: |
+        cd ${{ github.workspace }}
+        # 使用 susfs-main 分支集成
+        curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+        echo "SukiSU 与 SUSFS (main分支) 集成完成"
+
+    - name: 使用LLVM配置与编译内核
+      env:
+        ARCH: arm64
+        # 关键：使用 LLVM=1 启用完整的LLVM工具链[citation:9]
+        LLVM: 1
+      run: |
+        cd ${{ github.workspace }}
+
+        echo "=== 步骤1: 使用LLVM加载配置 ==="
+        # 假设你的配置文件是 stock_defconfig
+        make stock_defconfig
+
+        echo "=== 步骤2: (可选) 检查配置 ==="
+        grep -E "CONFIG_KPROBES|CONFIG_OVERLAY_FS|CONFIG_SUKI" .config || true
+
+        echo "=== 步骤3: 开始编译 (使用LLVM) ==="
+        # 使用LLVM工具链进行编译[citation:9]
+        make -j$(nproc) Image.gz-dtb 2>&1 | tee build.log
+
+        echo "=== 编译完成 ==="
+        if [ -f "arch/arm64/boot/Image.gz-dtb" ]; then
+          echo "✅ 内核镜像生成成功"
+          ls -lh arch/arm64/boot/Image.gz-dtb
+        else
+          echo "❌ 内核镜像未找到，编译可能失败"
+          exit 1
+        fi
+
+    - name: 打包 boot.img (使用设备原厂dtb)
+      run: |
+        cd ${{ github.workspace }}
+        echo "=== 准备AnyKernel3打包 ==="
+        wget -q https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.zip -O AnyKernel3.zip
+        unzip -q AnyKernel3.zip
+        rm AnyKernel3.zip
+        cp arch/arm64/boot/Image.gz-dtb AnyKernel3-master/
+
+        cat > AnyKernel3-master/anykernel.sh << 'EOF'
+        #!/bin/sh
+        # AnyKernel3 Script for FindX2
+        device.name1=findx2
+        device.name2=OP4E79L1
+        block=/dev/block/bootdevice/by-name/boot
+        is_slot_device=0
+        
+        # 核心：只刷内核，不更新dtb/dtbo
+        do.devicecheck=1
+        do.dtb=0
+        do.dtbo=0
+        do.modules=0
+        
+        dump_boot() {
+          dd if=$block of=/tmp/anykernel/boot-orig.img
+        }
+        write_boot() {
+          dd if=/tmp/anykernel/Image.gz-dtb of=$block
+        }
+        EOF
+
+        cd AnyKernel3-master
+        zip -r9 ${{ github.workspace }}/kernel-findx2-susfs-llvm.zip * -x .git README.md
+        echo "✅ 刷机包打包完成"
+
+    - name: 上传编译产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-susfs-build
+        path: |
+          ${{ github.workspace }}/arch/arm64/boot/Image.gz-dtb
+          ${{ github.workspace }}/kernel-findx2-susfs-llvm.zip
+          ${{ github.workspace }}/build.log
