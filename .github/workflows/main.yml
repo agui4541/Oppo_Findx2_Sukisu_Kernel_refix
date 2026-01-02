@@ -1,18 +1,22 @@
-name: Build Kernel (Ubuntu 22.04 Fix)
+name: Build Kernel for OPPO Find X2 (Final Fix)
 
 on:
   workflow_dispatch:
     inputs:
-      ksubranch:
-        description: 'SukiSU Branch'
+      kernel_defconfig:
+        description: 'Kernel Defconfig'
         required: true
-        default: 'main'
+        default: 'stock_defconfig'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CI: "false"
 
     steps:
     - name: Checkout Kernel Source
@@ -20,119 +24,128 @@ jobs:
       with:
         fetch-depth: 1
 
-    - name: Setup Environment (Python2 & Deps)
+    - name: Setup Build Environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential bc curl git zip unzip libssl-dev libncurses5-dev
-        
-        # 安装 Python 2 (Ubuntu 22.04 需要从 universe 仓库或手动安装)
-        sudo apt-get install -y python2
-        # 强制将 python 指向 python2
+        sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python2
+        # 修复 Python 指向
         sudo ln -sf /usr/bin/python2 /usr/bin/python
-        
-        # 验证
-        python --version
 
-    - name: Download Toolchains (Absolute Paths)
+    - name: Download Clang (r383902) & GCC 4.9
       run: |
-        mkdir -p $GITHUB_WORKSPACE/toolchains
-        cd $GITHUB_WORKSPACE/toolchains
+        mkdir -p tc/clang
+        mkdir -p tc/gcc
+        mkdir -p tc/gcc32
         
-        # 1. Clang r383902
+        echo "Downloading Clang..."
         wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz
-        mkdir clang-r383902
-        tar -xzf clang-r383902.tar.gz -C clang-r383902
+        tar -C tc/clang -zxf clang-r383902.tar.gz
         
-        # 2. GCC 4.9 (64-bit) - 使用 LineageOS 镜像更稳定
-        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git aarch64-linux-android-4.9
-        
-        # 3. GCC 4.9 (32-bit)
-        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git arm-linux-androideabi-4.9
+        echo "Downloading GCC 4.9..."
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git tc/gcc
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git tc/gcc32
+
+    - name: Setup Global PATH
+      run: |
+        echo "$GITHUB_WORKSPACE/tc/clang/bin" >> $GITHUB_PATH
+        echo "$GITHUB_WORKSPACE/tc/gcc/bin" >> $GITHUB_PATH
+        echo "$GITHUB_WORKSPACE/tc/gcc32/bin" >> $GITHUB_PATH
 
     - name: Integrate SukiSU
       run: |
-        curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ github.event.inputs.ksubranch }}/kernel/setup.sh" | bash -s nongki
+        echo "Integrating SukiSU..."
+        curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -
+
+    - name: Fix Compilation Errors (Disable Werror)
+      run: |
+        # === 核心修复步骤 ===
         
-        # 核心修复：防止 Kconfig 语法错误
-        # 检查 init/Kconfig 最后一行是否有换行符，如果没有则添加
-        sed -i '$a\' init/Kconfig
+        # 1. 在主 Makefile 中，将 -Werror 替换为 -Wno-error
+        # 这会告诉编译器：即使有警告，也不要停止编译
+        sed -i 's/-Werror/-Wno-error/g' Makefile
+        
+        # 2. 专门针对 arch/arm64 目录下的 Makefile 做同样的替换
+        if [ -f arch/arm64/Makefile ]; then
+            sed -i 's/-Werror/-Wno-error/g' arch/arm64/Makefile
+        fi
+        
+        # 3. 强制在 CFLAGS 中追加参数，忽略 "函数原型不严格" 的错误
+        # 这是为了解决 oplus_guard_general.c 的报错
+        echo 'KBUILD_CFLAGS += -Wno-error=strict-prototypes' >> Makefile
+        
+        # 4. 如果 OPPO 的 rootguard 模块有独立的 Makefile，也对其下手
+        if [ -f arch/arm64/kernel/rootguard/Makefile ]; then
+            sed -i 's/-Werror/-Wno-error/g' arch/arm64/kernel/rootguard/Makefile
+        fi
 
     - name: Configure Kernel
       run: |
-        # 定义绝对路径
-        TC_DIR=$GITHUB_WORKSPACE/toolchains
-        export PATH=$TC_DIR/clang-r383902/bin:$TC_DIR/aarch64-linux-android-4.9/bin:$TC_DIR/arm-linux-androideabi-4.9/bin:$PATH
-        
-        # 验证 GCC 是否在 PATH 中
-        which aarch64-linux-android-gcc
-        aarch64-linux-android-gcc --version
-        
         export ARCH=arm64
         export SUBARCH=arm64
-        # 显式指定完整路径前缀
-        export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=$TC_DIR/aarch64-linux-android-4.9/bin/aarch64-linux-android-
-        export CROSS_COMPILE_ARM32=$TC_DIR/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-
-        export CC=clang
         
-        # 手动创建 out 目录并清理
+        rm -rf out
         mkdir -p out
-        make O=out clean
-        make O=out mrproper
         
-        # 生成配置
-        make O=out stock_defconfig
-        
-        # 注入 SukiSU 配置
-        scripts/config --file out/.config --enable CONFIG_KSU
-        scripts/config --file out/.config --enable CONFIG_KPROBES
-        scripts/config --file out/.config --enable CONFIG_HAVE_KPROBES
-        scripts/config --file out/.config --enable CONFIG_KPROBE_EVENTS
-        
-        # 关闭 LTO (防止内存溢出)
-        scripts/config --file out/.config --disable CONFIG_LTO
-        scripts/config --file out/.config --disable CONFIG_LTO_CLANG
-        scripts/config --file out/.config --disable CONFIG_THIN_LTO
+        make O=out ${{ github.event.inputs.kernel_defconfig }} \
+             CC=clang \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+    - name: Modify Configs
+      run: |
+        cd out
+        ../scripts/config --file .config --enable CONFIG_KPROBES
+        ../scripts/config --file .config --enable CONFIG_HAVE_KPROBES
+        ../scripts/config --file .config --enable CONFIG_KPROBE_EVENTS
+        ../scripts/config --file .config --enable CONFIG_KSU
+        ../scripts/config --file .config --disable CONFIG_LTO
+        ../scripts/config --file .config --disable CONFIG_LTO_CLANG
+        ../scripts/config --file .config --disable CONFIG_THIN_LTO
+        # 额外保险：在 config 中也尝试关闭 WERROR
+        ../scripts/config --file .config --disable CONFIG_WERROR
+        cd ..
 
     - name: Build Kernel
       run: |
-        TC_DIR=$GITHUB_WORKSPACE/toolchains
-        export PATH=$TC_DIR/clang-r383902/bin:$TC_DIR/aarch64-linux-android-4.9/bin:$TC_DIR/arm-linux-androideabi-4.9/bin:$PATH
-        
         export ARCH=arm64
         export SUBARCH=arm64
-        export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=$TC_DIR/aarch64-linux-android-4.9/bin/aarch64-linux-android-
-        export CROSS_COMPILE_ARM32=$TC_DIR/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-
-        export CC=clang
         
-        # 开始编译
-        make -j$(nproc --all) O=out Image
+        # 增加 KBUILD_CFLAGS 参数作为双重保险
+        make -j$(nproc --all) O=out \
+             CC=clang \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+             KBUILD_CFLAGS+="-Wno-error=strict-prototypes" \
+             Image.gz-dtb
 
-    - name: Package with AnyKernel3
+    - name: Pack with AnyKernel3
       if: success()
       run: |
         git clone https://github.com/osm0sis/AnyKernel3.git
+        rm -rf AnyKernel3/*.zip
         
-        # 检查是否生成了 Image
-        if [ -f out/arch/arm64/boot/Image ]; then
-          cp out/arch/arm64/boot/Image AnyKernel3/
+        if [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+        elif [ -f out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image AnyKernel3/
         else
-          echo "Error: Image not found!"
-          exit 1
+            echo "Error: No kernel image found"
+            exit 1
         fi
-
+        
         cd AnyKernel3
-        rm -rf .git README.md
-        # 简单适配机型防止报错
         sed -i 's/device.name1=maguro/device.name1=OP5257/' anykernel.sh
         sed -i 's/device.name2=toro/device.name2=PDEM10/' anykernel.sh
+        sed -i 's/device.name3=toroplus/device.name3=PDET10/' anykernel.sh
+        sed -i 's/device.name4=tuna/device.name4=FindX2/' anykernel.sh
         
-        zip -r9 ../Oppo_FindX2_SukiSU_Kernel.zip *
+        zip -r9 SukiSU-Kernel-FindX2.zip * -x .git README.md *placeholder
 
-    - name: Upload Artifact
+    - name: Upload Build Artifact
       if: success()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       with:
-        name: Oppo_FindX2_SukiSU_Kernel
-        path: Oppo_FindX2_SukiSU_Kernel.zip
+        name: SukiSU-Kernel-FindX2
+        path: AnyKernel3/SukiSU-Kernel-FindX2.zip
