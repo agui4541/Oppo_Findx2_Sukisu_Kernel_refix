@@ -25,7 +25,10 @@ env:
   OUT_DIR: out
   DEFCONFIG: stock_defconfig
 
+  # Official AOSP clang archive (Android 11 r3, clang-r383902)
   AOSP_CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz"
+
+  # GCC 4.9 toolchains (LineageOS mirrors)
   GCC64_REPO: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git"
   GCC32_REPO: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git"
 
@@ -55,6 +58,7 @@ jobs:
             openssl \
             xz-utils zstd lz4 \
             ccache
+          # Some older Android kernel build scripts still call `python`
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python -V
           python2 -V
@@ -75,15 +79,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          # Better hit rate on re-runs: key does NOT include sha
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ github.ref_name }}-
             ccache-${{ runner.os }}-
 
       - name: Cache toolchains
         uses: actions/cache@v4
         with:
           path: toolchains
+          # Toolchains rarely change; keep key stable
           key: toolchains-${{ runner.os }}-aosp-clang-r383902-gcc49-v3
 
       - name: Download toolchains (AOSP clang-r383902 + GCC 4.9)
@@ -121,17 +126,28 @@ jobs:
             git clone --depth=1 "${GCC32_REPO}" arm-linux-androideabi-4.9
           fi
 
-          echo "CLANG_BIN=$GITHUB_WORKSPACE/toolchains/clang-r383902/bin" >> "$GITHUB_ENV"
-          echo "GCC64_PREFIX=$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin/aarch64-linux-android-" >> "$GITHUB_ENV"
-          echo "GCC32_PREFIX=$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-" >> "$GITHUB_ENV"
+          # IMPORTANT: set variables in THIS step, and also persist them for later steps.
+          CLANG_BIN="$GITHUB_WORKSPACE/toolchains/clang-r383902/bin"
+          GCC64_PREFIX="$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin/aarch64-linux-android-"
+          GCC32_PREFIX="$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-"
 
-          echo "$GITHUB_WORKSPACE/toolchains/clang-r383902/bin" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin" >> "$GITHUB_PATH"
-
-          "$GITHUB_WORKSPACE/toolchains/clang-r383902/bin/clang" --version
+          # Quick sanity checks (work in the same step)
+          "$CLANG_BIN/clang" --version
           "${GCC64_PREFIX}gcc" --version | head -n 1
           "${GCC32_PREFIX}gcc" --version | head -n 1
+
+          # Persist to next steps
+          {
+            echo "CLANG_BIN=$CLANG_BIN"
+            echo "GCC64_PREFIX=$GCC64_PREFIX"
+            echo "GCC32_PREFIX=$GCC32_PREFIX"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "$CLANG_BIN"
+            echo "$(dirname "$GCC64_PREFIX")"
+            echo "$(dirname "$GCC32_PREFIX")"
+          } >> "$GITHUB_PATH"
 
       - name: Clean output dir (mrproper)
         shell: bash
@@ -145,16 +161,6 @@ jobs:
         run: |
           set -euxo pipefail
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ inputs.sukisu_branch }}/kernel/setup.sh" | bash -s susfs-main 1
-
-      - name: Verify integration result (quick checks)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "Git status after integration:"
-          git status --porcelain || true
-          echo "Look for KernelSU/SukiSU driver dir (best-effort):"
-          ls -la drivers | head -n 200 || true
-          find drivers -maxdepth 3 -type d \( -iname "*kernelsu*" -o -iname "*sukisu*" -o -iname "*ksu*" \) -print || true
 
       - name: Configure kernel (stock_defconfig)
         shell: bash
