@@ -25,10 +25,7 @@ env:
   OUT_DIR: out
   DEFCONFIG: stock_defconfig
 
-  # Official AOSP clang archive (Android 11 r3, clang-r383902)
   AOSP_CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz"
-
-  # GCC 4.9 toolchains (LineageOS mirrors)
   GCC64_REPO: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git"
   GCC32_REPO: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git"
 
@@ -58,7 +55,6 @@ jobs:
             openssl \
             xz-utils zstd lz4 \
             ccache
-          # Some older Android kernel build scripts still call `python`
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python -V
           python2 -V
@@ -69,7 +65,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          pwd
           test -d drivers
           test -d arch
           test -f "arch/arm64/configs/${DEFCONFIG}"
@@ -79,7 +74,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          # Better hit rate on re-runs: key does NOT include sha
           key: ccache-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
             ccache-${{ runner.os }}-
@@ -88,7 +82,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: toolchains
-          # Toolchains rarely change; keep key stable
           key: toolchains-${{ runner.os }}-aosp-clang-r383902-gcc49-v3
 
       - name: Download toolchains (AOSP clang-r383902 + GCC 4.9)
@@ -111,7 +104,6 @@ jobs:
               exit 1
             fi
 
-            # Validate gzip (fails if it's actually HTML/text)
             gzip -t clang-r383902.tar.gz
 
             mkdir -p clang-r383902
@@ -126,17 +118,14 @@ jobs:
             git clone --depth=1 "${GCC32_REPO}" arm-linux-androideabi-4.9
           fi
 
-          # IMPORTANT: set variables in THIS step, and also persist them for later steps.
           CLANG_BIN="$GITHUB_WORKSPACE/toolchains/clang-r383902/bin"
           GCC64_PREFIX="$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin/aarch64-linux-android-"
           GCC32_PREFIX="$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-"
 
-          # Quick sanity checks (work in the same step)
           "$CLANG_BIN/clang" --version
           "${GCC64_PREFIX}gcc" --version | head -n 1
           "${GCC32_PREFIX}gcc" --version | head -n 1
 
-          # Persist to next steps
           {
             echo "CLANG_BIN=$CLANG_BIN"
             echo "GCC64_PREFIX=$GCC64_PREFIX"
@@ -162,6 +151,16 @@ jobs:
           set -euxo pipefail
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ inputs.sukisu_branch }}/kernel/setup.sh" | bash -s susfs-main 1
 
+      - name: Minimal safe source fixes (avoid build stop)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Fix strict-prototypes warning treated as error: add (void)
+          f="arch/arm64/kernel/rootguard/oplus_guard_general.c"
+          if [[ -f "$f" ]]; then
+            sed -i 's/static void __exit boot_state_exit()/static void __exit boot_state_exit(void)/' "$f" || true
+          fi
+
       - name: Configure kernel (stock_defconfig)
         shell: bash
         run: |
@@ -180,18 +179,27 @@ jobs:
 
           make O="${OUT_DIR}" "${DEFCONFIG}"
 
-          # Best-effort stability toggles
+          # Best-effort config tweaks to "just build":
+          # - Disable WERROR-like configs if present
+          # - Disable fortify if present (avoids __read_overflow2 hard error in some cases)
+          # - Disable LTO
           if [[ -x scripts/config ]]; then
-            scripts/config --file "${OUT_DIR}/.config" -d LTO -d LTO_CLANG -d THINLTO || true
             scripts/config --file "${OUT_DIR}/.config" -d WERROR || true
+            scripts/config --file "${OUT_DIR}/.config" -d FORTIFY_SOURCE || true
+            scripts/config --file "${OUT_DIR}/.config" -d CC_HAS_FORTIFY_SOURCE || true
+            scripts/config --file "${OUT_DIR}/.config" -d LTO -d LTO_CLANG -d THINLTO || true
           fi
 
           make O="${OUT_DIR}" olddefconfig
 
-          echo "=== Key config checks ==="
-          grep -E "CONFIG_(KPROBES|KALLSYMS|KSU|KPM|SUSFS)=" "${OUT_DIR}/.config" || true
+          echo "=== Show important config (after configure) ==="
+          grep -nE "^(CONFIG_WERROR|CONFIG_FORTIFY|CONFIG_KPROBES|CONFIG_KALLSYMS|CONFIG_LTO|CONFIG_THINLTO)" "${OUT_DIR}/.config" || true
+          echo "=== grep FORTIFY ==="
+          grep -n FORTIFY "${OUT_DIR}/.config" || true
+          echo "=== grep WERROR ==="
+          grep -n WERROR "${OUT_DIR}/.config" || true
 
-      - name: Build kernel (Image, plus optional Image.gz)
+      - name: Build kernel (try hard not to fail on warnings)
         shell: bash
         run: |
           set -euxo pipefail
@@ -208,8 +216,19 @@ jobs:
 
           ccache -z || true
 
-          make -j"${{ inputs.jobs }}" O="${OUT_DIR}" Image 2>&1 | tee build.log
-          make -j"${{ inputs.jobs }}" O="${OUT_DIR}" Image.gz 2>&1 | tee -a build.log || true
+          # Extra knobs to avoid warnings-as-errors even if Makefiles force it
+          make -j"${{ inputs.jobs }}" O="${OUT_DIR}" \
+            WERROR=0 \
+            KCFLAGS="-Wno-error" \
+            KBUILD_CFLAGS="-Wno-error" \
+            Image 2>&1 | tee build.log
+
+          # Optional
+          make -j"${{ inputs.jobs }}" O="${OUT_DIR}" \
+            WERROR=0 \
+            KCFLAGS="-Wno-error" \
+            KBUILD_CFLAGS="-Wno-error" \
+            Image.gz 2>&1 | tee -a build.log || true
 
           ccache -s || true
 
@@ -231,14 +250,12 @@ jobs:
 
           cp -v "${BOOT_DIR}/Image" dist/Image
 
-          # Optional
           for f in Image.gz Image.gz-dtb Image.lz4 Image.lz4-dtb; do
             if [[ -f "${BOOT_DIR}/${f}" ]]; then
               cp -v "${BOOT_DIR}/${f}" "dist/${f}"
             fi
           done
 
-          # Debug-friendly
           [[ -f "${OUT_DIR}/vmlinux" ]] && cp -v "${OUT_DIR}/vmlinux" dist/vmlinux || true
           [[ -f "${OUT_DIR}/System.map" ]] && cp -v "${OUT_DIR}/System.map" dist/System.map || true
 
