@@ -1,19 +1,23 @@
-name: Build oss-t kernel (SukiSU+SUSFS, AK3, no dtb/dtbo)
+name: Build kernel (oss-t, SukiSU+SUSFS, raw outputs)
 
 on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "make -j"
+        description: "Parallel jobs (make -jN)"
         required: true
         default: "16"
+      sukisu_branch:
+        description: "SukiSU-Ultra branch (usually main)"
+        required: true
+        default: "main"
 
 concurrency:
   group: kernel-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   ARCH: arm64
@@ -21,48 +25,53 @@ env:
   OUT_DIR: out
   DEFCONFIG: stock_defconfig
 
-  # Toolchain (per upstream README suggestions)
-  # NOTE: If this URL is not reachable for you, replace it with a pinned, known-good mirror of clang-r383902b1.
-  CLANG_URL: "https://github.com/ZyCromerZ/Clang/releases/download/17.0.0-20231024/clang-r383902b1.tar.gz"
-  GCC64_URL: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/lineage-19.1.tar.gz"
-  GCC32_URL: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9/archive/refs/heads/lineage-19.1.tar.gz"
-
-  # AnyKernel3
-  AK3_REPO: "https://github.com/osm0sis/AnyKernel3.git"
-  AK3_BRANCH: "master"
+  AOSP_CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz"
+  GCC64_REPO: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git"
+  GCC32_REPO: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           submodules: false
           lfs: false
 
-      - name: Install build deps
+      - name: Install dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates ccache clang curl flex g++ gcc git \
-            libelf-dev libssl-dev make ninja-build openssl python3 rsync unzip xz-utils zstd
-          python3 -V
+            build-essential bc bison flex \
+            ca-certificates curl file git unzip zip rsync \
+            libssl-dev libelf-dev libncurses5-dev \
+            python2 python3 \
+            openssl \
+            xz-utils zstd lz4 \
+            ccache
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          python -V
+          python2 -V
           git --version
+          ccache --version
 
-      - name: Debug tree (ensure kernel root)
+      - name: Verify kernel tree layout
         shell: bash
         run: |
           set -euxo pipefail
           pwd
-          ls -la
           test -d drivers
           test -d arch
-          test -f arch/arm64/configs/${DEFCONFIG}
+          test -f "arch/arm64/configs/${DEFCONFIG}"
+          echo "[OK] kernel root + defconfig OK"
 
-      - name: Setup ccache
+      - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
@@ -71,125 +80,164 @@ jobs:
             ccache-${{ runner.os }}-${{ github.ref_name }}-
             ccache-${{ runner.os }}-
 
-      - name: Restore toolchains cache
+      - name: Cache toolchains
         uses: actions/cache@v4
         with:
           path: toolchains
-          key: toolchains-${{ runner.os }}-r383902b1-gcc49-v1
+          key: toolchains-${{ runner.os }}-aosp-clang-r383902-gcc49-v3
 
-      - name: Fetch toolchains (clang-r383902b1 + gcc-4.9)
+      - name: Download toolchains (AOSP clang-r383902 + GCC 4.9)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p toolchains
-          cd toolchains
+          mkdir -p "$GITHUB_WORKSPACE/toolchains"
+          cd "$GITHUB_WORKSPACE/toolchains"
 
-          if [[ ! -d clang-r383902b1 ]]; then
-            echo "Fetching clang-r383902b1..."
-            mkdir -p clang-r383902b1
-            curl -L "${CLANG_URL}" -o clang.tar.gz
-            tar -xf clang.tar.gz -C clang-r383902b1 --strip-components=1
-            rm -f clang.tar.gz
+          if [[ ! -d clang-r383902 ]]; then
+            echo "Downloading AOSP clang-r383902..."
+            http_code="$(curl -L -sS -w "%{http_code}" -o clang-r383902.tar.gz "${AOSP_CLANG_URL}" || true)"
+            echo "HTTP: $http_code"
+            ls -lh clang-r383902.tar.gz || true
+
+            if [[ "$http_code" != "200" ]]; then
+              echo "[ERROR] clang download failed (HTTP $http_code). First 200 bytes:"
+              head -c 200 clang-r383902.tar.gz || true
+              echo
+              exit 1
+            fi
+
+            # Validate gzip (fails if it's actually HTML/text)
+            gzip -t clang-r383902.tar.gz
+
+            mkdir -p clang-r383902
+            tar -xzf clang-r383902.tar.gz -C clang-r383902
+            rm -f clang-r383902.tar.gz
           fi
 
-          if [[ ! -d gcc64 ]]; then
-            echo "Fetching gcc64 (aarch64-linux-android-4.9)..."
-            curl -L "${GCC64_URL}" -o gcc64.tar.gz
-            tar -xf gcc64.tar.gz
-            mv android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9-* gcc64
-            rm -f gcc64.tar.gz
+          if [[ ! -d aarch64-linux-android-4.9 ]]; then
+            git clone --depth=1 "${GCC64_REPO}" aarch64-linux-android-4.9
+          fi
+          if [[ ! -d arm-linux-androideabi-4.9 ]]; then
+            git clone --depth=1 "${GCC32_REPO}" arm-linux-androideabi-4.9
           fi
 
-          if [[ ! -d gcc32 ]]; then
-            echo "Fetching gcc32 (arm-linux-androideabi-4.9)..."
-            curl -L "${GCC32_URL}" -o gcc32.tar.gz
-            tar -xf gcc32.tar.gz
-            mv android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9-* gcc32
-            rm -f gcc32.tar.gz
-          fi
+          echo "CLANG_BIN=$GITHUB_WORKSPACE/toolchains/clang-r383902/bin" >> "$GITHUB_ENV"
+          echo "GCC64_PREFIX=$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin/aarch64-linux-android-" >> "$GITHUB_ENV"
+          echo "GCC32_PREFIX=$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-" >> "$GITHUB_ENV"
 
-          echo "CLANG_PATH=$GITHUB_WORKSPACE/toolchains/clang-r383902b1/bin" >> "$GITHUB_ENV"
-          echo "GCC64_PATH=$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_ENV"
-          echo "GCC32_PATH=$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/toolchains/clang-r383902/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin" >> "$GITHUB_PATH"
 
-          echo "$GITHUB_WORKSPACE/toolchains/clang-r383902b1/bin" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
+          "$GITHUB_WORKSPACE/toolchains/clang-r383902/bin/clang" --version
+          "${GCC64_PREFIX}gcc" --version | head -n 1
+          "${GCC32_PREFIX}gcc" --version | head -n 1
 
-          clang --version || true
-
-      - name: Integrate SukiSU + SUSFS (susfs-main)
+      - name: Clean output dir (mrproper)
         shell: bash
         run: |
           set -euxo pipefail
-          bash -c "$(curl -LSs https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh)" susfs-main 1
+          make O="${OUT_DIR}" mrproper
+          mkdir -p "${OUT_DIR}"
+
+      - name: Integrate SukiSU + SUSFS
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ inputs.sukisu_branch }}/kernel/setup.sh" | bash -s susfs-main 1
+
+      - name: Verify integration result (quick checks)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Git status after integration:"
+          git status --porcelain || true
+          echo "Look for KernelSU/SukiSU driver dir (best-effort):"
+          ls -la drivers | head -n 200 || true
+          find drivers -maxdepth 3 -type d \( -iname "*kernelsu*" -o -iname "*sukisu*" -o -iname "*ksu*" \) -print || true
 
       - name: Configure kernel (stock_defconfig)
         shell: bash
         run: |
           set -euxo pipefail
           export ARCH="${ARCH}"
+          export SUBARCH="${SUBARCH}"
 
-          export PATH="${CLANG_PATH}:${PATH}"
-          export CC="clang"
-          export CLANG_TRIPLE="aarch64-linux-gnu-"
-          export CROSS_COMPILE="${GCC64_PATH}/aarch64-linux-android-"
-          export CROSS_COMPILE_ARM32="${GCC32_PATH}/arm-linux-androideabi-"
+          # Enable ccache wrappers (Ubuntu)
+          export PATH="/usr/lib/ccache:${PATH}"
 
-          mkdir -p "${OUT_DIR}"
-          make -C "$(pwd)" O="$(pwd)/${OUT_DIR}" \
-            ARCH="${ARCH}" \
-            CROSS_COMPILE="${CROSS_COMPILE}" \
-            CLANG_TRIPLE="${CLANG_TRIPLE}" \
-            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
-            CC="${CC}" \
-            "${DEFCONFIG}"
+          export PATH="${CLANG_BIN}:${PATH}"
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE="${GCC64_PREFIX}"
+          export CROSS_COMPILE_ARM32="${GCC32_PREFIX}"
 
-          make -C "$(pwd)" O="$(pwd)/${OUT_DIR}" \
-            ARCH="${ARCH}" \
-            CROSS_COMPILE="${CROSS_COMPILE}" \
-            CLANG_TRIPLE="${CLANG_TRIPLE}" \
-            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
-            CC="${CC}" \
-            olddefconfig
+          make O="${OUT_DIR}" "${DEFCONFIG}"
 
-      - name: Build kernel
+          # Best-effort stability toggles
+          if [[ -x scripts/config ]]; then
+            scripts/config --file "${OUT_DIR}/.config" -d LTO -d LTO_CLANG -d THINLTO || true
+            scripts/config --file "${OUT_DIR}/.config" -d WERROR || true
+          fi
+
+          make O="${OUT_DIR}" olddefconfig
+
+          echo "=== Key config checks ==="
+          grep -E "CONFIG_(KPROBES|KALLSYMS|KSU|KPM|SUSFS)=" "${OUT_DIR}/.config" || true
+
+      - name: Build kernel (Image, plus optional Image.gz)
         shell: bash
         run: |
           set -euxo pipefail
           export ARCH="${ARCH}"
+          export SUBARCH="${SUBARCH}"
 
-          export PATH="${CLANG_PATH}:${PATH}"
-          export CC="clang"
-          export CLANG_TRIPLE="aarch64-linux-gnu-"
-          export CROSS_COMPILE="${GCC64_PATH}/aarch64-linux-android-"
-          export CROSS_COMPILE_ARM32="${GCC32_PATH}/arm-linux-androideabi-"
+          export PATH="/usr/lib/ccache:${PATH}"
 
-          make -j"${{ inputs.jobs }}" -C "$(pwd)" O="$(pwd)/${OUT_DIR}" \
-            ARCH="${ARCH}" \
-            CROSS_COMPILE="${CROSS_COMPILE}" \
-            CLANG_TRIPLE="${CLANG_TRIPLE}" \
-            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
-            CC="${CC}" \
-            2>&1 | tee build.log
+          export PATH="${CLANG_BIN}:${PATH}"
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE="${GCC64_PREFIX}"
+          export CROSS_COMPILE_ARM32="${GCC32_PREFIX}"
 
-      - name: Collect raw kernel outputs (before packaging)
+          ccache -z || true
+
+          make -j"${{ inputs.jobs }}" O="${OUT_DIR}" Image 2>&1 | tee build.log
+          make -j"${{ inputs.jobs }}" O="${OUT_DIR}" Image.gz 2>&1 | tee -a build.log || true
+
+          ccache -s || true
+
+      - name: Collect artifacts (raw outputs)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p dist/raw
+          mkdir -p dist
 
           BOOT_DIR="${OUT_DIR}/arch/arm64/boot"
           test -d "${BOOT_DIR}"
 
-          for f in Image Image.gz Image.gz-dtb; do
+          if [[ ! -f "${BOOT_DIR}/Image" ]]; then
+            echo "[ERROR] out/arch/arm64/boot/Image not found." >&2
+            echo "Available files under boot dir:" >&2
+            ls -la "${BOOT_DIR}" >&2 || true
+            exit 1
+          fi
+
+          cp -v "${BOOT_DIR}/Image" dist/Image
+
+          # Optional
+          for f in Image.gz Image.gz-dtb Image.lz4 Image.lz4-dtb; do
             if [[ -f "${BOOT_DIR}/${f}" ]]; then
-              cp -v "${BOOT_DIR}/${f}" "dist/raw/${f}"
+              cp -v "${BOOT_DIR}/${f}" "dist/${f}"
             fi
           done
 
-          cp -v "${OUT_DIR}/.config" dist/raw/kernel.config
-          cp -v build.log dist/raw/build.log
+          # Debug-friendly
+          [[ -f "${OUT_DIR}/vmlinux" ]] && cp -v "${OUT_DIR}/vmlinux" dist/vmlinux || true
+          [[ -f "${OUT_DIR}/System.map" ]] && cp -v "${OUT_DIR}/System.map" dist/System.map || true
+
+          cp -v "${OUT_DIR}/.config" dist/kernel.config
+          cp -v build.log dist/build.log
 
           {
             echo "repo: $GITHUB_REPOSITORY"
@@ -197,64 +245,14 @@ jobs:
             echo "sha: $GITHUB_SHA"
             echo "date_utc: $(date -u +%F_%T)"
             echo "clang: $(clang --version | head -n 1 || true)"
-          } | tee dist/raw/build-info.txt
+            echo "gcc64: $(${GCC64_PREFIX}gcc --version | head -n 1 || true)"
+          } | tee dist/build-info.txt
 
-          ls -la dist/raw
+          ls -la dist
 
-      - name: Upload raw artifacts
+      - name: Upload raw kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: raw-${{ github.run_number }}
-          path: dist/raw/*
-          if-no-files-found: error
-
-      - name: Prepare AnyKernel3 (AK3)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          rm -rf AnyKernel3
-          git clone --depth=1 --branch "${AK3_BRANCH}" "${AK3_REPO}" AnyKernel3
-
-          # Pick one kernel image to pack (prefer Image, then Image.gz, then Image.gz-dtb).
-          KIMG=""
-          for f in Image Image.gz Image.gz-dtb; do
-            if [[ -f "dist/raw/${f}" ]]; then
-              KIMG="dist/raw/${f}"
-              break
-            fi
-          done
-
-          if [[ -z "$KIMG" ]]; then
-            echo "[ERROR] No kernel image found in dist/raw (Image/Image.gz/Image.gz-dtb)." >&2
-            exit 1
-          fi
-
-          # Copy kernel into AK3 expected name: usually "Image"
-          cp -v "$KIMG" AnyKernel3/Image
-
-          # Do NOT include dtb/dtbo in the flashable zip.
-          rm -f AnyKernel3/dtb AnyKernel3/dtb.img AnyKernel3/dtbo.img AnyKernel3/*.dtb AnyKernel3/*.dtbo || true
-
-          cp -v dist/raw/build-info.txt AnyKernel3/build-info.txt
-          cp -v dist/raw/kernel.config AnyKernel3/kernel.config
-
-      - name: Create flashable zip (AK3, no dtb/dtbo)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p dist/ak3
-
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          ZIP_NAME="AK3-oss-t-sukisu-susfs-${{ github.run_number }}-${SHORT_SHA}.zip"
-
-          (cd AnyKernel3 && zip -r9 "../dist/ak3/${ZIP_NAME}" . -x ".git/*" ".github/*")
-          (cd dist/ak3 && sha256sum "${ZIP_NAME}" | tee "${ZIP_NAME}.sha256")
-
-          ls -la dist/ak3
-
-      - name: Upload AK3 zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: ak3-${{ github.run_number }}
-          path: dist/ak3/*
+          name: kernel-raw-${{ github.run_number }}
+          path: dist/*
           if-no-files-found: error
