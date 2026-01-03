@@ -1,4 +1,4 @@
-name: Build Kernel (Proton Clang Fix)
+name: Build Kernel (Stock Toolchain)
 
 on:
   workflow_dispatch:
@@ -24,57 +24,67 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential bc curl git zip unzip libssl-dev libncurses5-dev python2
+        # 强制将 python 指向 python2，修复 gcc-wrapper.py 报错
         sudo ln -sf /usr/bin/python2 /usr/bin/python
 
-    - name: Download Proton Clang 13
+    - name: Download Stock Toolchains (Clang r383902 + GCC 4.9)
       run: |
-        # Proton Clang 自带了完整的工具链，但前缀是 gnu-
-        git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+        mkdir -p $GITHUB_WORKSPACE/toolchains
+        cd $GITHUB_WORKSPACE/toolchains
+        
+        # 1. 下载 Google 官方 Clang r383902 (Android 11 标配)
+        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz
+        mkdir clang-r383902
+        tar -xzf clang-r383902.tar.gz -C clang-r383902
+        
+        # 2. 下载 GCC 4.9 (64位 + 32位)
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git aarch64-linux-android-4.9
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git arm-linux-androideabi-4.9
 
     - name: Integrate SukiSU
       run: |
         curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ github.event.inputs.ksubranch }}/kernel/setup.sh" | bash -s nongki
-        
-        # 修复 Kconfig 语法 (防止追加内容时未换行)
         sed -i '$a\' init/Kconfig
 
-    - name: Fix Source Code Errors (Auto Patch)
+    - name: Fix Source Code Errors
       run: |
-        echo "Applying auto-patches..."
-        
-        # 1. 修复 TWA_RESUME 兼容性 (4.19 内核没有这个宏)
-        sed -i '1i #ifndef TWA_RESUME\n#define TWA_RESUME true\n#endif' drivers/kernelsu/allowlist.c
-        
-        # 2. 移除 4.19 不支持的 MODULE_IMPORT_NS
-        sed -i '/MODULE_IMPORT_NS/d' drivers/kernelsu/ksu.c || true
-
-        # 3. 修复 Oplus RootGuard 函数原型
+        # 修复 RootGuard 函数原型
         if [ -f arch/arm64/kernel/rootguard/oplus_guard_general.c ]; then
             sed -i 's/static void __exit boot_state_exit()/static void __exit boot_state_exit(void)/' arch/arm64/kernel/rootguard/oplus_guard_general.c || true
         fi
         
-        # 4. 暴力去除 Makefile 中的 -Werror
+        # 修复 SukiSU API 兼容性 (4.19 缺少 MODULE_IMPORT_NS)
+        sed -i '/MODULE_IMPORT_NS/d' drivers/kernelsu/ksu.c || true
+        
+        # 修复 SukiSU TWA_RESUME 宏缺失
+        sed -i '1i #ifndef TWA_RESUME\n#define TWA_RESUME true\n#endif' drivers/kernelsu/allowlist.c
+        
+        # 强制忽略所有警告 (-Wno-error)
         sed -i 's/-Werror/-Wno-error/g' Makefile
         if [ -f arch/arm64/Makefile ]; then sed -i 's/-Werror/-Wno-error/g' arch/arm64/Makefile; fi
 
     - name: Configure Kernel
       run: |
-        # 设置 PATH 指向 Proton Clang
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        # 定义绝对路径变量
+        TC_DIR=$GITHUB_WORKSPACE/toolchains
+        CLANG_BIN=$TC_DIR/clang-r383902/bin
+        GCC64_BIN=$TC_DIR/aarch64-linux-android-4.9/bin
+        GCC32_BIN=$TC_DIR/arm-linux-androideabi-4.9/bin
+        
+        # 将所有 bin 目录加入 PATH，确保脚本能找到 gcc
+        export PATH=$CLANG_BIN:$GCC64_BIN:$GCC32_BIN:$PATH
         
         export ARCH=arm64
         export SUBARCH=arm64
         export CC=clang
-        
-        # === 核心修正 ===
-        # Proton Clang 的二进制文件是 aarch64-linux-gnu-gcc，不是 android-
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        # 指定交叉编译器前缀
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE=aarch64-linux-android-
+        export CROSS_COMPILE_ARM32=arm-linux-androideabi-
         
         mkdir -p out
         make O=out clean
         make O=out mrproper
-        
         make O=out stock_defconfig
         
         # SukiSU Configs
@@ -82,34 +92,42 @@ jobs:
         scripts/config --file out/.config --enable CONFIG_KPROBES
         scripts/config --file out/.config --enable CONFIG_HAVE_KPROBES
         scripts/config --file out/.config --enable CONFIG_KPROBE_EVENTS
+        # 禁用 LTO (旧编译器开 LTO 必挂)
         scripts/config --file out/.config --disable CONFIG_LTO
         scripts/config --file out/.config --disable CONFIG_LTO_CLANG
         scripts/config --file out/.config --disable CONFIG_THIN_LTO
+        scripts/config --file out/.config --disable CONFIG_WERROR
 
     - name: Build Kernel
       run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        TC_DIR=$GITHUB_WORKSPACE/toolchains
+        CLANG_BIN=$TC_DIR/clang-r383902/bin
+        GCC64_BIN=$TC_DIR/aarch64-linux-android-4.9/bin
+        GCC32_BIN=$TC_DIR/arm-linux-androideabi-4.9/bin
+        
+        export PATH=$CLANG_BIN:$GCC64_BIN:$GCC32_BIN:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
-        export CC=clang
         
-        # === 核心修正 ===
-        # 使用 gnu- 前缀
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        # 使用旧版 Clang 时，不需要 --target 参数，因为它依赖 GCC 进行汇编
+        # KCFLAGS=-w 屏蔽警告
+        # KBUILD_CFLAGS 追加参数防止报错
         
-        # -w: 忽略警告
         make -j$(nproc --all) O=out \
-             KCFLAGS="-w -DMODULE_IMPORT_NS(x)=" \
-             KBUILD_CFLAGS+="-Wno-error" \
+             CC=clang \
+             CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-android- \
+             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+             KCFLAGS="-w -DMODULE_IMPORT_NS(x)= -DTWA_RESUME=1" \
+             KBUILD_CFLAGS+="-Wno-error -DMODULE_IMPORT_NS(x)= -DTWA_RESUME=1" \
              Image.gz-dtb
 
-    # === 检查点：编译完成立即上传 ===
-    - name: CHECKPOINT - Upload Compiled Image
+    # === Checkpoint ===
+    - name: Upload Raw Kernel Image
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: Image-Checkpoint
+        name: Image-Only-Backup
         path: |
           out/arch/arm64/boot/Image
           out/arch/arm64/boot/Image.gz
@@ -119,7 +137,6 @@ jobs:
       if: success()
       run: |
         git clone https://github.com/osm0sis/AnyKernel3.git
-        
         if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
           cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
         elif [ -f out/arch/arm64/boot/Image.gz ]; then
@@ -130,14 +147,10 @@ jobs:
           echo "Error: Image not found"
           exit 1
         fi
-        
         cd AnyKernel3
         rm -rf .git README.md
         sed -i 's/device.name1=maguro/device.name1=OP5257/' anykernel.sh
         sed -i 's/device.name2=toro/device.name2=PDEM10/' anykernel.sh
-        sed -i 's/device.name3=toroplus/device.name3=PDET10/' anykernel.sh
-        sed -i 's/device.name4=tuna/device.name4=FindX2/' anykernel.sh
-        
         zip -r9 ../Oppo_FindX2_SukiSU_Kernel.zip *
 
     - name: Upload Final Zip
