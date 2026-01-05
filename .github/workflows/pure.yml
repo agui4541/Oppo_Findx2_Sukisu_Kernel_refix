@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04 # 仍然是 x86_64 runner，进行交叉编译
 
     steps:
     - name: Checkout Kernel Source
@@ -18,7 +18,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libdevmapper-dev python3 libtinfo-dev wget ccache rsync zip
+        sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libdevmapper-dev python3 libtinfo-dev wget ccache rsync zip python2 # 安装 python2
 
     - name: Setup Toolchains
       run: |
@@ -41,33 +41,37 @@ jobs:
         echo "PATH=$PWD/toolchains/aarch64-linux-android-4.9/bin:$PATH" >> $GITHUB_ENV
         echo "PATH=$PWD/toolchains/clang-r383902b1/bin:$PATH" >> $GITHUB_ENV
 
-        # 设置架构
+        # 设置架构和编译器
         echo "ARCH=arm64" >> $GITHUB_ENV
-        # 使用 Clang 时，CROSS_COMPILE 通常设置为标准 GNU 前缀
         echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        # 设置 Clang 使用的 triple
         echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        # 设置 HOST_PYTHON 为 python2 以解决脚本中的 Python 2 语法问题
+        echo "HOST_PYTHON=python2" >> $GITHUB_ENV
+        echo "PYTHON=python2" >> $GITHUB_ENV
 
-        echo "Toolchains setup complete for Clang + GCC 4.9."
+        echo "Toolchains and Python setup complete for Clang + GCC 4.9."
 
     - name: Apply Defconfig
       run: |
         mkdir -p out
-        # 使用正确的 defconfig 文件路径
-        make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- stock_config
+        # 使用正确的 defconfig 文件路径 (stock_defconfig)
+        # 并传递 HOST_PYTHON
+        ls arch/arm64/configs/ # 列出配置文件，方便检查
+        # 现在使用 stock_defconfig
+        make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- HOST_PYTHON=python2 PYTHON=python2 stock_defconfig
         echo "Defconfig applied."
 
     - name: Build Kernel with Clang + GCC
       run: |
-        # 使用 Clang 编译器，链接器使用 lld
-        make O=out -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang LD=ld.lld
+        # 使用 Clang 编译器，链接器使用 lld，并传递 HOST_PYTHON
+        make O=out -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang LD=ld.lld HOST_PYTHON=python2 PYTHON=python2
         echo "Kernel build complete (Clang + GCC)."
 
     # --- 新增步骤：上传原始编译产物 ---
     - name: Upload Raw Kernel Image Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Raw-Compiled-Kernel-${{ github.sha }} # Artifact 名称包含提交 SHA，区分原始文件
+        name: Raw-Compiled-Kernel-${{ github.sha }}
         path: out/arch/arm64/boot/Image* # 上传 Image, Image.gz 等原始内核镜像文件
 
     # --- 以下步骤与之前相同，用于 AnyKernel3 打包 ---
