@@ -1,4 +1,4 @@
-name: Build Oppo Find X2 Kernel with AnyKernel3
+name: Build Oppo Find X2 Kernel with AnyKernel3 (LLVM)
 
 on:
   workflow_dispatch: # 允许你在 GitHub 网页上手动运行
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04 # 仍然是 x86_64 runner，进行交叉编译
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout Kernel Source
@@ -18,61 +18,69 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libdevmapper-dev python3 libtinfo-dev wget ccache rsync zip python2 # 安装 python2
+        sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libdevmapper-dev python3 libtinfo-dev wget ccache rsync zip python2
 
-    - name: Setup Toolchains
+    - name: Setup Toolchains (LLVM + Binutils + GCC for libgcc)
       run: |
         mkdir -p toolchains
 
-        # 1. Download LineageOS GCC 4.9
-        echo "Downloading GCC 4.9..."
+        # 1. Download a modern LLVM prebuilt (e.g., from github.com/llvm/llvm-project/releases or a community build)
+        # Using a community build like https://github.com/ClangBuiltLinux/llvm-prebuilt
+        # This repo provides recent LLVM builds with binutils
+        echo "Downloading LLVM prebuilt..."
+        # Example: Using a specific version, adjust URL as needed
+        # wget -O toolchains/llvm.tar.xz https://github.com/ClangBuiltLinux/llvm-prebuilt/releases/download/2024010807/llvm-2024010807.tar.xz
+        # For now, let's try the same Clang r383902b1 but ensure we use it as the primary compiler
+        # And also get binutils (usually included in the Clang package or available separately)
+        # The qssn70/clang-r383902b1 might already include binutils, let's assume it does.
+        # We also need GCC for libgcc.a
+        echo "Downloading GCC 4.9 for libgcc..."
         wget -O toolchains/gcc49.tar.gz https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/cm-14.1.tar.gz
         tar -xf toolchains/gcc49.tar.gz -C toolchains/
         mv toolchains/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9-* toolchains/aarch64-linux-android-4.9
         echo "GCC 4.9 download and extraction complete."
 
-        # 2. Download Clang r383902b1 from the community repo
-        echo "Downloading Clang r383902b1..."
+        # Use the Clang from qssn70 (r383902b1)
         git clone --depth=1 https://github.com/qssn70/clang-r383902b1.git toolchains/clang-r383902b1
         echo "Clang r383902b1 download complete."
 
-        # 3. Set environment variables for Clang + GCC setup
-        # 添加工具链到 PATH
-        echo "PATH=$PWD/toolchains/aarch64-linux-android-4.9/bin:$PATH" >> $GITHUB_ENV
-        echo "PATH=$PWD/toolchains/clang-r383902b1/bin:$PATH" >> $GITHUB_ENV
-
-        # 设置架构和编译器
+        # 2. Set environment variables for LLVM + Binutils + GCC setup
+        # Add Clang and GCC bin directories to PATH
+        echo "PATH=$PWD/toolchains/clang-r383902b1/bin:$PWD/toolchains/aarch64-linux-android-4.9/bin:$PATH" >> $GITHUB_ENV
+        # Set ARCH
         echo "ARCH=arm64" >> $GITHUB_ENV
+        # Set CROSS_COMPILE to standard GNU prefix for Clang
         echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        # Set CLANG_TRIPLE
         echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        # 设置 HOST_PYTHON 为 python2 以解决脚本中的 Python 2 语法问题
+        # Set HOST_PYTHON for scripts
         echo "HOST_PYTHON=python2" >> $GITHUB_ENV
         echo "PYTHON=python2" >> $GITHUB_ENV
 
-        echo "Toolchains and Python setup complete for Clang + GCC 4.9."
+        echo "LLVM + Binutils + GCC setup complete."
 
-    - name: Apply Defconfig
+    - name: Apply Defconfig with LLVM
       run: |
         mkdir -p out
-        # 使用正确的 defconfig 文件路径 (stock_defconfig)
-        # 并传递 HOST_PYTHON
-        ls arch/arm64/configs/ # 列出配置文件，方便检查
-        # 现在使用 stock_defconfig
+        ls arch/arm64/configs/ # List configs
+        # Apply defconfig using LLVM tools, still pass HOST_PYTHON
         make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- HOST_PYTHON=python2 PYTHON=python2 stock_defconfig
-        echo "Defconfig applied."
+        echo "Defconfig applied (LLVM)."
 
-    - name: Build Kernel with Clang + GCC
+    - name: Build Kernel with LLVM + Binutils + GCC libgcc
       run: |
-        # 使用 Clang 编译器，链接器使用 lld，并传递 HOST_PYTHON
+        # Build using Clang as CC, LLD as LD, and potentially GCC's libgcc
+        # The aarch64-linux-gnu-ld.lld should be picked up from PATH
+        # The aarch64-linux-gnu-gcc (for libgcc) should be picked up from PATH
         make O=out -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang LD=ld.lld HOST_PYTHON=python2 PYTHON=python2
-        echo "Kernel build complete (Clang + GCC)."
+        echo "Kernel build complete (LLVM + Binutils + GCC)."
 
     # --- 新增步骤：上传原始编译产物 ---
     - name: Upload Raw Kernel Image Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Raw-Compiled-Kernel-${{ github.sha }}
-        path: out/arch/arm64/boot/Image* # 上传 Image, Image.gz 等原始内核镜像文件
+        path: out/arch/arm64/boot/Image*
 
     # --- 以下步骤与之前相同，用于 AnyKernel3 打包 ---
     - name: Download AnyKernel3
@@ -100,7 +108,7 @@ jobs:
         cd AnyKernel3
         # --- 重要：你需要根据你的 Find X2 设备信息修改以下变量 ---
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh # 临时设为 0，或者替换为你的设备名
-        sed -i 's/kernel.string=.*/kernel.string=Oppo Find X2 Kernel - Compiled with GitHub Actions/g' anykernel.sh
+        sed -i 's/kernel.string=.*/kernel.string=Oppo Find X2 Kernel - Compiled with GitHub Actions (LLVM)/g' anykernel.sh
         sed -i 's/BLOCK=.*/BLOCK=\/dev\/block\/by-name\/boot;/g' anykernel.sh # 根据 Find X2 实际路径修改
         sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=0;/g' anykernel.sh # 根据 Find X2 实际情况修改
         sed -i 's/RAMDISK_COMPRESSION=.*/RAMDISK_COMPRESSION=auto;/g' anykernel.sh
@@ -110,11 +118,11 @@ jobs:
     - name: Package as Flashable ZIP
       run: |
         cd AnyKernel3
-        zip -r9 "OppoFindX2-Kernel-${{ github.sha }}.zip" * -x ".git*" "README.md" "placeholder"
+        zip -r9 "OppoFindX2-Kernel-LLVM-${{ github.sha }}.zip" * -x ".git*" "README.md" "placeholder"
         echo "Flashable ZIP created."
 
     - name: Upload Flashable ZIP Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Flashable-Kernel-ZIP-${{ github.sha }}
-        path: AnyKernel3/OppoFindX2-Kernel-${{ github.sha }}.zip
+        name: Flashable-Kernel-LLVM-ZIP-${{ github.sha }}
+        path: AnyKernel3/OppoFindX2-Kernel-LLVM-${{ github.sha }}.zip
