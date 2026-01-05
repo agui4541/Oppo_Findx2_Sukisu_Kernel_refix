@@ -1,86 +1,230 @@
-name: Build Oppo Find X2 Kernel with AnyKernel3 (LLVM)
+name: Build Oppo Find X2 Kernel with AnyKernel3 (Based on ref_workflow)
 
 on:
   workflow_dispatch: # 允许你在 GitHub 网页上手动运行
-  # push:
-  #   branches: [ build ] # 或者当推送到 'build' 分支时自动运行
+    inputs:
+      jobs:
+        description: "Parallel jobs (make -jN)"
+        required: true
+        default: "16"
+      # 暂时不需要 SukiSU 分支输入
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  OUT_DIR: out
+  DEFCONFIG: stock_defconfig
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180 # 设置超时时间
 
     steps:
     - name: Checkout Kernel Source
       uses: actions/checkout@v4
       with:
+        fetch-depth: 1 # 只获取最新提交，减少克隆时间
         submodules: recursive
 
-    - name: Install Dependencies
+    - name: Install Dependencies and Setup Python
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libdevmapper-dev python3 libtinfo-dev wget ccache rsync zip python2
+        # 关键：将 python 指向 python2，解决 gcc-version.sh 等脚本的 Python 2/3 兼容性问题
+        sudo ln -sf /usr/bin/python2 /usr/bin/python
+        python -V # 验证 python 版本
+        python2 -V # 验证 python2 版本
 
-    - name: Setup Toolchains (LLVM + Binutils + GCC for libgcc)
+    # --- 从 ref_workflow 借鉴：验证内核树布局 ---
+    - name: Verify kernel tree layout
+      shell: bash
       run: |
-        mkdir -p toolchains
+        set -euxo pipefail
+        test -d drivers
+        test -d arch
+        test -f "arch/arm64/configs/${{ env.DEFCONFIG }}"
+        echo "[OK] kernel root + defconfig OK"
 
-        # 1. Download a modern LLVM prebuilt (e.g., from github.com/llvm/llvm-project/releases or a community build)
-        # Using a community build like https://github.com/ClangBuiltLinux/llvm-prebuilt
-        # This repo provides recent LLVM builds with binutils
-        echo "Downloading LLVM prebuilt..."
-        # Example: Using a specific version, adjust URL as needed
-        # wget -O toolchains/llvm.tar.xz https://github.com/ClangBuiltLinux/llvm-prebuilt/releases/download/2024010807/llvm-2024010807.tar.xz
-        # For now, let's try the same Clang r383902b1 but ensure we use it as the primary compiler
-        # And also get binutils (usually included in the Clang package or available separately)
-        # The qssn70/clang-r383902b1 might already include binutils, let's assume it does.
-        # We also need GCC for libgcc.a
-        echo "Downloading GCC 4.9 for libgcc..."
-        wget -O toolchains/gcc49.tar.gz https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/cm-14.1.tar.gz
-        tar -xf toolchains/gcc49.tar.gz -C toolchains/
-        mv toolchains/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9-* toolchains/aarch64-linux-android-4.9
-        echo "GCC 4.9 download and extraction complete."
-
-        # Use the Clang from qssn70 (r383902b1)
-        git clone --depth=1 https://github.com/qssn70/clang-r383902b1.git toolchains/clang-r383902b1
-        echo "Clang r383902b1 download complete."
-
-        # 2. Set environment variables for LLVM + Binutils + GCC setup
-        # Add Clang and GCC bin directories to PATH
-        echo "PATH=$PWD/toolchains/clang-r383902b1/bin:$PWD/toolchains/aarch64-linux-android-4.9/bin:$PATH" >> $GITHUB_ENV
-        # Set ARCH
-        echo "ARCH=arm64" >> $GITHUB_ENV
-        # Set CROSS_COMPILE to standard GNU prefix for Clang
-        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        # Set CLANG_TRIPLE
-        echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        # Set HOST_PYTHON for scripts
-        echo "HOST_PYTHON=python2" >> $GITHUB_ENV
-        echo "PYTHON=python2" >> $GITHUB_ENV
-
-        echo "LLVM + Binutils + GCC setup complete."
-
-    - name: Apply Defconfig with LLVM
+    # --- 从 ref_workflow 借鉴：下载工具链 ---
+    - name: Download toolchains (AOSP clang-r383902 + GCC 4.9)
+      shell: bash
       run: |
-        mkdir -p out
-        ls arch/arm64/configs/ # List configs
-        # Apply defconfig using LLVM tools, still pass HOST_PYTHON
-        make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- HOST_PYTHON=python2 PYTHON=python2 stock_defconfig
-        echo "Defconfig applied (LLVM)."
+        set -euxo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/toolchains"
+        cd "$GITHUB_WORKSPACE/toolchains"
 
-    - name: Build Kernel with LLVM + Binutils + GCC libgcc
+        # AOSP Clang r383902
+        if [[ ! -d clang-r383902 ]]; then
+            echo "Downloading AOSP clang-r383902..."
+            # 注意：这里使用与 ref_workflow 相同的 URL，可能需要调整
+            # 由于直接从 AOSP 源码下载 .tar.gz 不太方便，我们仍然使用 qssn70 的仓库
+            git clone --depth=1 https://github.com/qssn70/clang-r383902b1.git clang-r383902
+            # 如果 ref_workflow 的 URL 可用，可以替换为：
+            # wget -O clang-r383902.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r3/clang-r383902.tar.gz
+            # mkdir -p clang-r383902 && tar -xzf clang-r383902.tar.gz -C clang-r383902
+        fi
+
+        # GCC 4.9 64-bit
+        if [[ ! -d aarch64-linux-android-4.9 ]]; then
+            git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git aarch64-linux-android-4.9
+        fi
+        # GCC 4.9 32-bit (可能被内核构建系统需要)
+        if [[ ! -d arm-linux-androideabi-4.9 ]]; then
+            git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git arm-linux-androideabi-4.9
+        fi
+
+        CLANG_BIN="$GITHUB_WORKSPACE/toolchains/clang-r383902/bin"
+        GCC64_PREFIX="$GITHUB_WORKSPACE/toolchains/aarch64-linux-android-4.9/bin/aarch64-linux-android-"
+        GCC32_PREFIX="$GITHUB_WORKSPACE/toolchains/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-"
+
+        "$CLANG_BIN/clang" --version
+        "${GCC64_PREFIX}gcc" --version | head -n 1
+        "${GCC32_PREFIX}gcc" --version | head -n 1
+
+        # 设置环境变量
+        echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
+        echo "GCC64_PREFIX=$GCC64_PREFIX" >> $GITHUB_ENV
+        echo "GCC32_PREFIX=$GCC32_PREFIX" >> $GITHUB_ENV
+
+        # 将工具链路径添加到 PATH
+        echo "$CLANG_BIN" >> $GITHUB_PATH
+        echo "$(dirname "$GCC64_PREFIX")" >> $GITHUB_PATH
+        echo "$(dirname "$GCC32_PREFIX")" >> $GITHUB_PATH
+
+    # --- 从 ref_workflow 借鉴：清理输出目录 ---
+    - name: Clean output dir (mrproper)
+      shell: bash
       run: |
-        # Build using Clang as CC, LLD as LD, and potentially GCC's libgcc
-        # The aarch64-linux-gnu-ld.lld should be picked up from PATH
-        # The aarch64-linux-gnu-gcc (for libgcc) should be picked up from PATH
-        make O=out -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CC=clang LD=ld.lld HOST_PYTHON=python2 PYTHON=python2
-        echo "Kernel build complete (LLVM + Binutils + GCC)."
+        set -euxo pipefail
+        make O="${{ env.OUT_DIR }}" mrproper
+        mkdir -p "${{ env.OUT_DIR }}"
 
-    # --- 新增步骤：上传原始编译产物 ---
+    # --- 从 ref_workflow 借鉴：配置内核 ---
+    - name: Configure kernel (stock_defconfig + olddefconfig)
+      shell: bash
+      run: |
+        set -euxo pipefail
+        export ARCH="${{ env.ARCH }}"
+        export SUBARCH="${{ env.SUBARCH }}"
+
+        # 设置编译器和交叉编译前缀
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE="${{ env.GCC64_PREFIX }}"
+        export CROSS_COMPILE_ARM32="${{ env.GCC32_PREFIX }}"
+
+        # 应用 defconfig
+        make O="${{ env.OUT_DIR }}" "${{ env.DEFCONFIG }}"
+
+        # Best-effort config tweaks to "just build":
+        # - Disable WERROR-like configs if present
+        # - Disable fortify if present
+        # - Disable LTO
+        if [[ -x scripts/config ]]; then
+          scripts/config --file "${{ env.OUT_DIR }}/.config" -d WERROR || true
+          scripts/config --file "${{ env.OUT_DIR }}/.config" -d FORTIFY_SOURCE || true
+          scripts/config --file "${{ env.OUT_DIR }}/.config" -d CC_HAS_FORTIFY_SOURCE || true
+          scripts/config --file "${{ env.OUT_DIR }}/.config" -d LTO -d LTO_CLANG -d THINLTO || true
+        fi
+
+        # 使用 olddefconfig 解决潜在的配置不一致问题
+        make O="${{ env.OUT_DIR }}" olddefconfig
+
+        echo "=== Show important config (after configure) ==="
+        grep -nE "^(CONFIG_WERROR|CONFIG_FORTIFY|CONFIG_KPROBES|CONFIG_KALLSYMS|CONFIG_LTO|CONFIG_THINLTO)" "${{ env.OUT_DIR }}/.config" || true
+        echo "=== grep FORTIFY ==="
+        grep -n FORTIFY "${{ env.OUT_DIR }}/.config" || true
+        echo "=== grep WERROR ==="
+        grep -n WERROR "${{ env.OUT_DIR }}/.config" || true
+
+    # --- 从 ref_workflow 借鉴：编译内核 ---
+    - name: Build Kernel
+      shell: bash
+      run: |
+        set -euxo pipefail
+        export ARCH="${{ env.ARCH }}"
+        export SUBARCH="${{ env.SUBARCH }}"
+
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE="${{ env.GCC64_PREFIX }}"
+        export CROSS_COMPILE_ARM32="${{ env.GCC32_PREFIX }}"
+
+        # 使用输入的并行任务数，默认 16
+        jobs=${{ github.event.inputs.jobs || '16' }}
+
+        # Extra knobs to avoid warnings-as-errors
+        make -j"$jobs" O="${{ env.OUT_DIR }}" \
+          WERROR=0 \
+          KCFLAGS="-Wno-error" \
+          KBUILD_CFLAGS="-Wno-error" \
+          Image 2>&1 | tee build.log
+
+        # 可选：编译 Image.gz
+        make -j"$jobs" O="${{ env.OUT_DIR }}" \
+          WERROR=0 \
+          KCFLAGS="-Wno-error" \
+          KBUILD_CFLAGS="-Wno-error" \
+          Image.gz 2>&1 | tee -a build.log || true
+
+        echo "Kernel build complete."
+
+    # --- 从 ref_workflow 借鉴：收集原始产物 ---
+    - name: Collect artifacts (raw outputs)
+      shell: bash
+      run: |
+        set -euxo pipefail
+        mkdir -p dist
+
+        BOOT_DIR="${{ env.OUT_DIR }}/arch/arm64/boot"
+        test -d "${BOOT_DIR}"
+
+        if [[ ! -f "${BOOT_DIR}/Image" ]]; then
+          echo "[ERROR] out/arch/arm64/boot/Image not found." >&2
+          echo "Available files under boot dir:" >&2
+          ls -la "${BOOT_DIR}" >&2 || true
+          exit 1
+        fi
+
+        cp -v "${BOOT_DIR}/Image" dist/Image
+
+        for f in Image.gz Image.gz-dtb Image.lz4 Image.lz4-dtb; do
+          if [[ -f "${BOOT_DIR}/${f}" ]]; then
+            cp -v "${BOOT_DIR}/${f}" "dist/${f}"
+          fi
+        done
+
+        [[ -f "${{ env.OUT_DIR }}/vmlinux" ]] && cp -v "${{ env.OUT_DIR }}/vmlinux" dist/vmlinux || true
+        [[ -f "${{ env.OUT_DIR }}/System.map" ]] && cp -v "${{ env.OUT_DIR }}/System.map" dist/System.map || true
+
+        cp -v "${{ env.OUT_DIR }}/.config" dist/kernel.config
+        cp -v build.log dist/build.log
+
+        {
+          echo "repo: $GITHUB_REPOSITORY"
+          echo "ref: $GITHUB_REF"
+          echo "sha: $GITHUB_SHA"
+          echo "date_utc: $(date -u +%F_%T)"
+          echo "clang: $(clang --version | head -n 1 || true)"
+          echo "gcc64: $(${{ env.GCC64_PREFIX }}gcc --version | head -n 1 || true)"
+        } | tee dist/build-info.txt
+
+        ls -la dist
+
+    # --- 上传原始编译产物 ---
     - name: Upload Raw Kernel Image Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Raw-Compiled-Kernel-${{ github.sha }}
-        path: out/arch/arm64/boot/Image*
+        path: dist/* # 上传 dist 目录下的所有文件
 
     # --- 以下步骤与之前相同，用于 AnyKernel3 打包 ---
     - name: Download AnyKernel3
@@ -91,15 +235,16 @@ jobs:
 
     - name: Copy Kernel Image to AnyKernel3
       run: |
-        if [ -f out/arch/arm64/boot/Image ]; then
+        # 从 dist 目录复制编译好的 Image
+        if [ -f dist/Image ]; then
             echo "Found Image, copying to AnyKernel3..."
-            cp out/arch/arm64/boot/Image AnyKernel3/
-        elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp dist/Image AnyKernel3/
+        elif [ -f dist/Image.gz ]; then
             echo "Found Image.gz, copying to AnyKernel3..."
-            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+            cp dist/Image.gz AnyKernel3/
         else
-            echo "ERROR: Kernel image (Image or Image.gz) not found in out/arch/arm64/boot/!"
-            ls -la out/arch/arm64/boot/
+            echo "ERROR: Kernel image (Image or Image.gz) not found in dist/!"
+            ls -la dist/
             exit 1
         fi
 
@@ -108,7 +253,7 @@ jobs:
         cd AnyKernel3
         # --- 重要：你需要根据你的 Find X2 设备信息修改以下变量 ---
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh # 临时设为 0，或者替换为你的设备名
-        sed -i 's/kernel.string=.*/kernel.string=Oppo Find X2 Kernel - Compiled with GitHub Actions (LLVM)/g' anykernel.sh
+        sed -i 's/kernel.string=.*/kernel.string=Oppo Find X2 Kernel - Compiled with GitHub Actions (Based on ref_workflow)/g' anykernel.sh
         sed -i 's/BLOCK=.*/BLOCK=\/dev\/block\/by-name\/boot;/g' anykernel.sh # 根据 Find X2 实际路径修改
         sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=0;/g' anykernel.sh # 根据 Find X2 实际情况修改
         sed -i 's/RAMDISK_COMPRESSION=.*/RAMDISK_COMPRESSION=auto;/g' anykernel.sh
@@ -118,11 +263,11 @@ jobs:
     - name: Package as Flashable ZIP
       run: |
         cd AnyKernel3
-        zip -r9 "OppoFindX2-Kernel-LLVM-${{ github.sha }}.zip" * -x ".git*" "README.md" "placeholder"
+        zip -r9 "OppoFindX2-Kernel-Based-ref_workflow-${{ github.sha }}.zip" * -x ".git*" "README.md" "placeholder"
         echo "Flashable ZIP created."
 
     - name: Upload Flashable ZIP Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Flashable-Kernel-LLVM-ZIP-${{ github.sha }}
-        path: AnyKernel3/OppoFindX2-Kernel-LLVM-${{ github.sha }}.zip
+        name: Flashable-Kernel-Based-ref_workflow-ZIP-${{ github.sha }}
+        path: AnyKernel3/OppoFindX2-Kernel-Based-ref_workflow-${{ github.sha }}.zip
