@@ -15,14 +15,14 @@ env:
   KERNEL_SOURCE : "https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git"
   KERNEL_BRANCH : "oss-t"
 
-  CLANG_SOURCE : "https://github.com/ZyCromerZ/Clang/releases/download/10.0.1-20220724-release/Clang-10.0.1-20220724.tar.gz"
+  CLANG_SOURCE : "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz"
   CLANG_BRANCH : ""
 
   GCC_GNU : false
-  GCC_64_SOURCE : "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9.git"
-  GCC_64_BRANCH : "android12L-release"
-  GCC_32_SOURCE : "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9.git"
-  GCC_32_BRANCH : "android12L-release"
+  GCC_64_SOURCE : "https://github.com/JackA1ltman/Google-GCC-Android-4.9.git"
+  GCC_64_BRANCH : "aarch64"
+  GCC_32_SOURCE : "https://github.com/JackA1ltman/Google-GCC-Android-4.9.git"
+  GCC_32_BRANCH : "arm32"
 
   DEFCONFIG_SOURCE: ""
   DEFCONFIG_NAME : "arch/arm64/configs/stock_defconfig"
