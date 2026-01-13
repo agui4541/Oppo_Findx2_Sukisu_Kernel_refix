@@ -63,6 +63,7 @@
 #include <linux/compat.h>
 #include <linux/vmalloc.h>
 
+#include <linux/compiler.h>  // for unlikely()
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
@@ -1906,14 +1907,32 @@ out_ret:
 	return retval;
 }
 
+// 声明 KSU hook 符号
+#ifdef CONFIG_KSU
+extern bool ksu_execveat_hook __read_mostly;
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+                               void *argv, void *envp, int *flags);
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+                                        void *argv, void *envp, int *flags);
+#endif
+
 static int do_execveat_common(int fd, struct filename *filename,
 			      struct user_arg_ptr argv,
 			      struct user_arg_ptr envp,
 			      int flags)
 {
+	// ====== KernelSU Hook Point (Non-GKI Manual Integration) ======
+#ifdef CONFIG_KSU
+	if (unlikely(ksu_execveat_hook)) {
+		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+	} else {
+		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+	}
+#endif
+	// =============================================================
+
 	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
 }
-
 int do_execve_file(struct file *file, void *__argv, void *__envp)
 {
 	struct user_arg_ptr argv = { .ptr.native = __argv };
